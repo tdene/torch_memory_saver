@@ -56,6 +56,10 @@ def run(hook_mode: str):
     # to the wrong place shows.
     full_bytes = 5 * chunk + granularity
     pattern = torch.arange(251, dtype=torch.uint8).repeat(full_bytes // 251 + 1)[:full_bytes]
+    # A process's first device operations take device memory of their own: run them on an
+    # ordinary tensor before the first reading.
+    normal_tensor = torch.full((1_000_000,), 100, dtype=torch.uint8, device=device)
+    assert _holds(normal_tensor, 100)
     free_start = free_bytes()
     with torch_memory_saver.region(tag=_TAG_FULL, enable_cpu_backup=True, chunk_size=chunk):
         full = pattern.to(device)
@@ -121,6 +125,7 @@ def run(hook_mode: str):
     expected[2] = expected[3] = True
     assert states(_TAG_PART) == expected
     assert _holds(part[: 2 * chunk], 3) and torch.equal(full.cpu(), pattern)
+    assert _holds(normal_tensor, 100)
 
     # Return the regions' memory before the interpreter exits: the tensors, then their pools.
     del full, second, part
