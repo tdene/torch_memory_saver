@@ -30,6 +30,7 @@ from examples import (
     resume_oom,
     allocation_granularity,
     malloc_oom,
+    release_region_pools,
 )
 
 # XPU only supports hook_mode='torch'; MUSA supports both hook modes.
@@ -271,6 +272,24 @@ def test_malloc_oom():
         check=True,
         timeout=120,
     )
+
+
+@_cuda_only
+@pytest.mark.skipif(
+    not _device_module.is_available(),
+    reason="Dropping a region's memory pools requires a GPU",
+)
+@pytest.mark.parametrize("hook_mode", _HOOK_MODES)
+def test_release_region_pools(hook_mode):
+    ctx = torch_memory_saver.configure_subprocess() if hook_mode == "preload" else nullcontext()
+    with ctx:
+        # PyTorch can end the process where a pool is destroyed: the child's exit status is the result.
+        subprocess.run(
+            [sys.executable, release_region_pools.__file__, hook_mode],
+            env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+            check=True,
+            timeout=300,
+        )
 
 
 @pytest.mark.skipif(

@@ -20,6 +20,17 @@ _TAG_DEFAULT = "default"
 CpuBackupBackend = Literal["mmap", "pinned"]
 # torch.OutOfMemoryError, which older PyTorch has only as torch.cuda.OutOfMemoryError.
 _OutOfMemoryError = getattr(torch, "OutOfMemoryError", torch.cuda.OutOfMemoryError)
+# Up to PyTorch 2.7 a segment that a tensor still occupies when its pool is dropped is later
+# returned with cudaFree, not through the pool's allocator, which torch-mode memory needs.
+_MIN_TORCH_FOR_POOL_RELEASE = (2, 8)
+
+
+def _is_cuda_build() -> bool:
+    return not (torch.version.hip or is_xpu() or is_musa())
+
+
+def _torch_version() -> tuple:
+    return tuple(int(part) for part in torch.__version__.split(".")[:2])
 
 
 class TorchMemorySaver:
@@ -107,6 +118,29 @@ class TorchMemorySaver:
         """
         self._ensure_initialized()
         return self._impl.get_allocation_granularity(device)
+
+    def release_region_pools(self, tag: Optional[str] = None) -> int:
+        """Drop the memory pools of the regions of one tag (None: of every tag) and
+        return how many were dropped.
+
+        A pool keeps the memory of deleted tensors, paused or not, for the next
+        region with the same arguments. Memory that no tensor occupies is freed at
+        once; memory of live tensors follows when they are deleted and the cache is
+        emptied. A later region() with the same arguments gets a new pool.
+
+        Raises RuntimeError, dropping nothing, while one of the pools is in use by an
+        open region or a CUDA graph. CUDA with PyTorch >= 2.8 only:
+        NotImplementedError otherwise.
+        """
+        if not _is_cuda_build():
+            raise NotImplementedError("release_region_pools() is only supported on CUDA")
+        if _torch_version() < _MIN_TORCH_FOR_POOL_RELEASE:
+            raise NotImplementedError(
+                "release_region_pools() needs PyTorch >= "
+                f"{'.'.join(map(str, _MIN_TORCH_FOR_POOL_RELEASE))}, found {torch.__version__}"
+            )
+        self._ensure_initialized()
+        return self._impl.release_region_pools(tag)
 
     # for compatibility
     @property
@@ -446,6 +480,29 @@ class _TorchMemorySaverImpl:
         if not 0 <= device < device_count:
             raise ValueError(f"device {device} is outside [0, {device_count})")
         return cdll.tms_get_allocation_granularity(device)
+
+    def release_region_pools(self, tag: Optional[str]) -> int:
+        # A pool is named inside the comprehension only: the traceback of the error below keeps
+        # this frame, and a pool bound in it would live as long as that error, through a later
+        # call that drops the pool.
+        # list(): a region on another thread may add its pool meanwhile.
+        selected = [
+            (key, pool.use_count() != 1)
+            for key, pool in list(self._mem_pools.items())
+            if tag is None or key[0] == tag
+        ]
+        in_use = [key for key, used in selected if used]
+        if in_use:
+            raise RuntimeError(
+                f"torch_memory_saver.release_region_pools(tag={tag!r}): the memory pools "
+                f"{in_use} are in use by an open region or a CUDA graph; no pool was released"
+            )
+        dropped = 0
+        for key, _ in selected:
+            # pop(): a call on another thread may have dropped the pool meanwhile.
+            if self._mem_pools.pop(key, None) is not None:
+                dropped += 1
+        return dropped
 
     def _sync_affected_devices(self, tag: Optional[str]):
         for device in self._affected_devices(tag):
