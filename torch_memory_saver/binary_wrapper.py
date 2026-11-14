@@ -61,6 +61,11 @@ def _setup_function_signatures(cdll):
     cdll.tms_get_cpu_backup_pointer.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint64]
     cdll.tms_get_cpu_backup_pointer.restype = ctypes.POINTER(ctypes.c_uint8)
 
+    # CUDA-only symbols.
+    if hasattr(cdll, "tms_get_allocation_granularity"):
+        cdll.tms_get_allocation_granularity.argtypes = [ctypes.c_int]
+        cdll.tms_get_allocation_granularity.restype = ctypes.c_size_t
+
     # XPU-only symbols.
     if hasattr(cdll, "tms_xpu_prewarm_devices"):
         cdll.tms_xpu_prewarm_devices.argtypes = [ctypes.c_int]

@@ -28,6 +28,7 @@ from examples import (
     xpu_scenarios,
     free_outside_region,
     resume_oom,
+    allocation_granularity,
 )
 
 # XPU only supports hook_mode='torch'; MUSA supports both hook modes.
@@ -235,6 +236,24 @@ def test_resume_oom(hook_mode):
             env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
             check=True,
             timeout=300,
+        )
+
+
+@_cuda_only
+@pytest.mark.skipif(
+    not _device_module.is_available(),
+    reason="The allocation granularity of a device requires a GPU",
+)
+@pytest.mark.parametrize("hook_mode", _HOOK_MODES)
+def test_allocation_granularity(hook_mode):
+    ctx = torch_memory_saver.configure_subprocess() if hook_mode == "preload" else nullcontext()
+    with ctx:
+        # The hook ends the process if the driver refuses the query: the child's exit status is the result.
+        subprocess.run(
+            [sys.executable, allocation_granularity.__file__, hook_mode],
+            env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+            check=True,
+            timeout=120,
         )
 
 

@@ -206,6 +206,12 @@ uint8_t* tms_get_cpu_backup_pointer(const uint8_t* gpu_ptr, uint64_t size) {
     return TorchMemorySaver::instance().get_cpu_backup_pointer(gpu_ptr, size);
 }
 
+#if defined(USE_CUDA)
+size_t tms_get_allocation_granularity(int device) {
+    return CUDAUtils::cu_mem_get_allocation_size(1, CUDAUtils::cu_device_get(device));
+}
+#endif
+
 #if defined(USE_XPU)
 void tms_xpu_prewarm_devices(int n_devices) {
     XPUImplementation::xpu_prewarm_devices(n_devices);

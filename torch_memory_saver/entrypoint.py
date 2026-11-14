@@ -1,5 +1,6 @@
 import atexit
 import ctypes
+import operator
 
 import numpy as np
 import logging
@@ -96,6 +97,16 @@ class TorchMemorySaver:
         """
         self._ensure_initialized()
         self._impl.resume(tag=tag)
+
+    def get_allocation_granularity(self, device: Optional[int] = None) -> int:
+        """Granularity of device memory in bytes: the size of an allocation on the
+        device (None: the current device) is rounded up to a multiple of it.
+
+        CUDA only: NotImplementedError on other backends. Raises ValueError for a
+        device outside [0, device_count()).
+        """
+        self._ensure_initialized()
+        return self._impl.get_allocation_granularity(device)
 
     # for compatibility
     @property
@@ -422,6 +433,19 @@ class _TorchMemorySaverImpl:
                 f"(code {ret}). Every matching allocation is still paused and keeps "
                 "its backup; free device memory and call resume() again."
             )
+
+    def get_allocation_granularity(self, device: Optional[int]) -> int:
+        cdll = self._binary_wrapper.cdll
+        if not hasattr(cdll, "tms_get_allocation_granularity"):
+            raise NotImplementedError("get_allocation_granularity() is only supported on CUDA")
+        # Reading the current device also initialises the driver, which the query needs.
+        current_device = self._current_device()
+        device = current_device if device is None else operator.index(device)
+        device_count = self._device_module.device_count()
+        # The hook ends the process when the driver does not know the device.
+        if not 0 <= device < device_count:
+            raise ValueError(f"device {device} is outside [0, {device_count})")
+        return cdll.tms_get_allocation_granularity(device)
 
     def _sync_affected_devices(self, tag: Optional[str]):
         for device in self._affected_devices(tag):
