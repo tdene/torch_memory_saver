@@ -35,7 +35,8 @@ cudaError_t try_map(void *ptr, size_t size, CUmemGenericAllocationHandle handle,
     return cudaSuccess;
 }
 
-// One address range that a call has to back with a handle of its own.
+// One address range that a call has to map: through a handle of its own, which create_all()
+// makes, or, when it is added after create_all(), through the handle of another chunk.
 struct PendingMapping {
     void *address;
     size_t size;
@@ -95,6 +96,16 @@ void *chunk_ptr(void *ptr, const AllocationMetadata &metadata, size_t index) {
     return static_cast<uint8_t *>(ptr) + index * metadata.chunk_size;
 }
 
+// A chunk that map_chunks mapped shares the memory of its source: unmapping it frees none.
+void unmap_borrowed_chunks(void *ptr, const AllocationMetadata &metadata) {
+    for (size_t i = 0; i < metadata.chunks.size(); ++i) {
+        if (metadata.chunks[i].source != nullptr) {
+            CURESULT_CHECK(cuMemUnmap(
+                (CUdeviceptr) chunk_ptr(ptr, metadata, i), chunk_bytes(metadata, i)));
+        }
+    }
+}
+
 void release_own_chunks(void *ptr, const AllocationMetadata &metadata) {
     for (size_t i = 0; i < metadata.chunks.size(); ++i) {
         if (metadata.chunks[i].own) {
@@ -139,8 +150,8 @@ void offload_chunks(void *ptr, AllocationMetadata &metadata) {
     size_t total = 0;
     for (size_t i = 0; i < metadata.chunks.size(); ++i) {
         Chunk &chunk = metadata.chunks[i];
-        chunk.backup_offset = chunk.own ? total : kNoChunkBackup;
-        if (chunk.own) {
+        chunk.backup_offset = chunk.holds_memory() ? total : kNoChunkBackup;
+        if (chunk.holds_memory()) {
             total += chunk_bytes(metadata, i);
         }
     }
@@ -368,6 +379,28 @@ cudaError_t TorchMemorySaver::free(void *ptr) {
 
         metadata = allocation_metadata_[ptr];
         allocation_metadata_.erase(ptr);
+
+#if defined(USE_CUDA)
+        // Chunks that other allocations mapped from this one lose their memory with it.
+        if (metadata.chunk_size != 0) {
+            CUDA_ERROR_CHECK(cudaDeviceSynchronize());
+            for (auto &kv : allocation_metadata_) {
+                AllocationMetadata &borrower = kv.second;
+                for (size_t i = 0; i < borrower.chunks.size(); ++i) {
+                    Chunk &chunk = borrower.chunks[i];
+                    if (chunk.source != ptr) {
+                        continue;
+                    }
+                    if (borrower.state == AllocationState::ACTIVE) {
+                        CURESULT_CHECK(cuMemUnmap(
+                            (CUdeviceptr) chunk_ptr(kv.first, borrower, i), chunk_bytes(borrower, i)));
+                    }
+                    chunk.source = nullptr;
+                    chunk.backup_offset = kNoChunkBackup;
+                }
+            }
+        }
+#endif
     }
 
     CUDA_ERROR_CHECK(cudaDeviceSynchronize());
@@ -375,6 +408,7 @@ cudaError_t TorchMemorySaver::free(void *ptr) {
 #if defined(USE_CUDA)
     if (metadata.chunk_size != 0) {
         if (AllocationState::ACTIVE == metadata.state) {
+            unmap_borrowed_chunks(ptr, metadata);
             release_own_chunks(ptr, metadata);
         }
     } else
@@ -449,6 +483,22 @@ cudaError_t TorchMemorySaver::pause(const std::string& tag) {
 #else
     const std::lock_guard <std::mutex> lock(allocator_metadata_mutex_);
 
+#if defined(USE_CUDA)
+    // Memory that an active allocation of another tag maps would not return to the device,
+    // and resume() would give the tag other memory than that allocation maps.
+    for (const auto &kv : allocation_metadata_) {
+        const AllocationMetadata &borrower = kv.second;
+        if (tag.empty() || borrower.tag == tag || borrower.state != AllocationState::ACTIVE) {
+            continue;
+        }
+        for (const Chunk &chunk : borrower.chunks) {
+            if (chunk.source != nullptr && allocation_metadata_.at(chunk.source).tag == tag) {
+                return kMappedChunkOrder;
+            }
+        }
+    }
+#endif
+
     for (auto it = allocation_metadata_.begin(); it != allocation_metadata_.end(); ++it) {
         void *ptr = it->first;
         AllocationMetadata& metadata = it->second;
@@ -467,9 +517,12 @@ cudaError_t TorchMemorySaver::pause(const std::string& tag) {
 
 #if defined(USE_CUDA)
         if (metadata.chunk_size != 0) {
+            // A mapped chunk is backed up through this allocation's address. Its memory lives
+            // until its last mapping is gone, whichever of the two allocations goes first.
             if (metadata.enable_cpu_backup) {
                 offload_chunks(ptr, metadata);
             }
+            unmap_borrowed_chunks(ptr, metadata);
             release_own_chunks(ptr, metadata);
             metadata.state = AllocationState::PAUSED;
             continue;
@@ -535,10 +588,18 @@ cudaError_t TorchMemorySaver::resume(const std::string& tag) {
 
         if (metadata.chunk_size != 0) {
             for (size_t i = 0; i < metadata.chunks.size(); ++i) {
-                if (metadata.chunks[i].own) {
+                const Chunk &chunk = metadata.chunks[i];
+                if (chunk.own) {
                     pending.push_back(PendingMapping{
                         chunk_ptr(kv.first, metadata, i), chunk_bytes(metadata, i),
                         metadata.device, &metadata.chunks[i].handle});
+                } else if (chunk.source != nullptr) {
+                    // Mapped below from its source, which has to hold memory by then: it is
+                    // active, or this call resumes it.
+                    const AllocationMetadata &source = allocation_metadata_.at(chunk.source);
+                    if (source.state != AllocationState::ACTIVE && !tag.empty() && source.tag != tag) {
+                        return kMappedChunkOrder;
+                    }
                 }
             }
             continue;
@@ -550,6 +611,21 @@ cudaError_t TorchMemorySaver::resume(const std::string& tag) {
     cudaError_t pending_ret = create_all(pending);
     if (pending_ret != cudaSuccess) {
         return pending_ret;
+    }
+    // The handles of the sources are current now, those that this call made included.
+    for (auto &kv : allocation_metadata_) {
+        AllocationMetadata &metadata = kv.second;
+        if (!tag.empty() && metadata.tag != tag) {
+            continue;
+        }
+        for (size_t i = 0; i < metadata.chunks.size(); ++i) {
+            const Chunk &chunk = metadata.chunks[i];
+            if (chunk.source != nullptr) {
+                pending.push_back(PendingMapping{
+                    chunk_ptr(kv.first, metadata, i), chunk_bytes(metadata, i), metadata.device,
+                    &allocation_metadata_.at(chunk.source).chunks[chunk.source_index].handle});
+            }
+        }
     }
     pending_ret = map_all(pending);
     if (pending_ret != cudaSuccess) {
@@ -725,8 +801,8 @@ size_t TorchMemorySaver::get_chunk_layout(
         const AllocationMetadata &metadata = *refs[i].metadata;
         out_addresses[i] = (uint64_t) chunk_ptr(refs[i].base, metadata, refs[i].index);
         out_sizes[i] = chunk_bytes(metadata, refs[i].index);
-        out_states[i] =
-            metadata.state == AllocationState::ACTIVE && metadata.chunks[refs[i].index].own;
+        out_states[i] = metadata.state == AllocationState::ACTIVE
+            && metadata.chunks[refs[i].index].holds_memory();
     }
     return refs.size();
 }
@@ -737,6 +813,7 @@ int TorchMemorySaver::resume_chunks(const std::string& tag, const size_t* indice
     const std::set<size_t> wanted(indices, indices + count);
 
     std::vector<PendingMapping> pending;
+    std::vector<Chunk*> given;
     for (const size_t index : wanted) {
         if (index >= refs.size()) {
             return TMS_CHUNK_INDEX_OUT_OF_RANGE;
@@ -746,10 +823,11 @@ int TorchMemorySaver::resume_chunks(const std::string& tag, const size_t* indice
             return TMS_CHUNK_ALLOCATION_PAUSED;
         }
         Chunk &chunk = metadata.chunks[refs[index].index];
-        if (!chunk.own) {
+        if (!chunk.holds_memory()) {
             pending.push_back(PendingMapping{
                 chunk_ptr(refs[index].base, metadata, refs[index].index),
                 chunk_bytes(metadata, refs[index].index), metadata.device, &chunk.handle});
+            given.push_back(&chunk);
         }
     }
     // Every handle first, then every mapping: out of memory leaves the chunks as they were.
@@ -760,8 +838,56 @@ int TorchMemorySaver::resume_chunks(const std::string& tag, const size_t* indice
         release_created(pending);
         return TMS_CHUNK_OUT_OF_MEMORY;
     }
-    for (const size_t index : wanted) {
-        refs[index].metadata->chunks[refs[index].index].own = true;
+    for (Chunk *chunk : given) {
+        chunk->own = true;
+    }
+    return TMS_CHUNK_OK;
+}
+
+int TorchMemorySaver::map_chunks(
+    const std::string& dst_tag, const size_t* dst_indices,
+    const std::string& src_tag, const size_t* src_indices, size_t count) {
+    const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+    const std::vector<ChunkRef> dst_refs = chunks_of_tag(dst_tag);
+    const std::vector<ChunkRef> src_refs = chunks_of_tag(src_tag);
+
+    std::set<size_t> destinations;
+    std::vector<PendingMapping> pending;
+    for (size_t i = 0; i < count; ++i) {
+        if (dst_indices[i] >= dst_refs.size() || src_indices[i] >= src_refs.size()) {
+            return TMS_CHUNK_INDEX_OUT_OF_RANGE;
+        }
+        const ChunkRef &dst = dst_refs[dst_indices[i]];
+        const ChunkRef &src = src_refs[src_indices[i]];
+        if (dst.metadata->state != AllocationState::ACTIVE
+                || src.metadata->state != AllocationState::ACTIVE) {
+            return TMS_CHUNK_ALLOCATION_PAUSED;
+        }
+        if (dst.metadata->chunks[dst.index].holds_memory()
+                || !destinations.insert(dst_indices[i]).second) {
+            return TMS_CHUNK_DESTINATION_HOLDS_MEMORY;
+        }
+        Chunk &src_chunk = src.metadata->chunks[src.index];
+        if (!src_chunk.own) {
+            return TMS_CHUNK_SOURCE_WITHOUT_MEMORY;
+        }
+        const size_t bytes = chunk_bytes(*dst.metadata, dst.index);
+        if (bytes != chunk_bytes(*src.metadata, src.index)
+                || dst.metadata->device != src.metadata->device) {
+            return TMS_CHUNK_PAIR_MISMATCH;
+        }
+        pending.push_back(PendingMapping{
+            chunk_ptr(dst.base, *dst.metadata, dst.index), bytes, dst.metadata->device,
+            &src_chunk.handle});
+    }
+    if (map_all(pending) != cudaSuccess) {
+        return TMS_CHUNK_OUT_OF_MEMORY;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        const ChunkRef &dst = dst_refs[dst_indices[i]];
+        const ChunkRef &src = src_refs[src_indices[i]];
+        dst.metadata->chunks[dst.index].source = src.base;
+        dst.metadata->chunks[dst.index].source_index = src.index;
     }
     return TMS_CHUNK_OK;
 }

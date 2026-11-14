@@ -30,7 +30,12 @@ _CHUNK_ERRORS = {
     2: (_OutOfMemoryError, "the device has no memory for the chunks"),
     -1: (IndexError, "a chunk index is out of range for the tag"),
     -2: (RuntimeError, "an allocation of the tag is paused"),
+    -3: (ValueError, "a destination chunk holds memory already or is listed twice"),
+    -4: (ValueError, "a source chunk holds no memory of its own"),
+    -5: (ValueError, "a destination chunk and its source chunk differ in size or device"),
 }
+# kMappedChunkOrder in csrc/core.h: pause() or resume() against the order that map_chunks() needs.
+_MAPPED_CHUNK_ORDER = 1
 
 
 def _raise_for_chunk_status(status: int, call: str) -> None:
@@ -80,8 +85,8 @@ class TorchMemorySaver:
         get_allocation_granularity() and applies to every allocation made in the
         region, PyTorch's pool segments included. pause(tag) and resume(tag) treat
         such an allocation as a whole and pass chunks without memory by;
-        get_chunk_layout(), get_chunk_states() and resume_chunks() address its
-        chunks by tag. No disk backup.
+        get_chunk_layout(), get_chunk_states(), resume_chunks() and map_chunks()
+        address its chunks by tag. No disk backup.
 
         initially_released (CUDA only): the region's allocations reserve address
         space only. Each is born paused, with no device memory and no backup, and
@@ -180,6 +185,33 @@ class TorchMemorySaver:
         """
         self._ensure_initialized()
         self._impl.resume_chunks(tag, chunk_indices)
+
+    def map_chunks(
+        self,
+        dst_tag: str,
+        dst_chunk_indices: Sequence[int],
+        src_tag: str,
+        src_chunk_indices: Sequence[int],
+    ) -> None:
+        """Map chunks of src_tag a second time, at the addresses of chunks of dst_tag.
+
+        The lists have equal length and are mapped one to one in order. The two
+        chunks of a pair are then one piece of device memory at two addresses: a
+        write through one address is visible through the other once the writing
+        operation has completed. A destination chunk must hold no memory, a source
+        chunk must hold memory of its own, and the two must have the same size.
+        All or nothing: ValueError, IndexError, RuntimeError (a tag is paused) or
+        torch.OutOfMemoryError with nothing changed.
+
+        pause(dst_tag) unmaps the chunks, after backing their contents up through
+        its own addresses when its region has CPU backup; resume(dst_tag) maps
+        them again from the memory src_tag holds then and restores that backup.
+        Pause dst_tag before src_tag and resume it after: pause(src_tag) raises
+        RuntimeError while dst_tag maps its chunks, resume(dst_tag) while src_tag
+        is paused. Freeing either allocation removes the mapping. CUDA only.
+        """
+        self._ensure_initialized()
+        self._impl.map_chunks(dst_tag, dst_chunk_indices, src_tag, src_chunk_indices)
 
     def release_region_pools(self, tag: Optional[str] = None) -> int:
         """Drop the memory pools of the regions of one tag (None: of every tag) and
@@ -600,6 +632,11 @@ class _TorchMemorySaverImpl:
                 f"(code {ret}); some allocations could not be released and are "
                 "retained. Retry after resolving the failure."
             )
+        if ret == _MAPPED_CHUNK_ORDER:
+            raise RuntimeError(
+                f"torch_memory_saver.pause(tag={tag!r}): another tag maps chunks of this "
+                "tag (map_chunks) and is not paused; pause that tag first. Nothing was changed."
+            )
 
     def resume(self, tag: Optional[str]):
         tag_bytes = tag.encode("utf-8") if tag else None
@@ -612,6 +649,11 @@ class _TorchMemorySaverImpl:
                     "resolving the failure (e.g. free device memory)."
                 )
             self._sync_affected_devices(tag)
+        elif ret == _MAPPED_CHUNK_ORDER:
+            raise RuntimeError(
+                f"torch_memory_saver.resume(tag={tag!r}): the tag maps chunks of a tag "
+                "that is paused (map_chunks); resume that tag first. Nothing was changed."
+            )
         elif ret != 0:
             raise _OutOfMemoryError(
                 f"torch_memory_saver.resume(tag={tag!r}) ran out of device memory "
@@ -656,6 +698,30 @@ class _TorchMemorySaverImpl:
         indices = (ctypes.c_size_t * len(chunk_indices))(*chunk_indices)
         status = self._chunk_cdll().tms_resume_chunks(tag.encode("utf-8"), indices, len(indices))
         _raise_for_chunk_status(status, f"resume_chunks(tag={tag!r})")
+
+    def map_chunks(
+        self,
+        dst_tag: str,
+        dst_chunk_indices: Sequence[int],
+        src_tag: str,
+        src_chunk_indices: Sequence[int],
+    ) -> None:
+        count = len(dst_chunk_indices)
+        if count != len(src_chunk_indices):
+            raise ValueError(
+                f"map_chunks() got {count} destination chunks for {len(src_chunk_indices)} source chunks"
+            )
+        index_array = ctypes.c_size_t * count
+        status = self._chunk_cdll().tms_map_chunks(
+            dst_tag.encode("utf-8"),
+            index_array(*dst_chunk_indices),
+            src_tag.encode("utf-8"),
+            index_array(*src_chunk_indices),
+            count,
+        )
+        _raise_for_chunk_status(
+            status, f"map_chunks(dst_tag={dst_tag!r}, src_tag={src_tag!r})"
+        )
 
     def release_region_pools(self, tag: Optional[str]) -> int:
         # A pool is named inside the comprehension only: the traceback of the error below keeps

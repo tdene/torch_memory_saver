@@ -256,6 +256,13 @@ size_t tms_get_chunk_layout(
 int tms_resume_chunks(const char* tag, const size_t* indices, size_t count) {
     return TorchMemorySaver::instance().resume_chunks(tag, indices, count);
 }
+
+int tms_map_chunks(
+    const char* dst_tag, const size_t* dst_indices,
+    const char* src_tag, const size_t* src_indices, size_t count) {
+    return TorchMemorySaver::instance().map_chunks(
+        dst_tag, dst_indices, src_tag, src_indices, count);
+}
 #endif
 
 #if defined(USE_XPU)

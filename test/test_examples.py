@@ -34,6 +34,7 @@ from examples import (
     tag_scope_shared_pool,
     initially_released,
     chunked,
+    map_chunks,
 )
 
 # XPU only supports hook_mode='torch'; MUSA supports both hook modes.
@@ -331,6 +332,16 @@ def test_initially_released(hook_mode):
 @pytest.mark.parametrize("hook_mode", _HOOK_MODES)
 def test_chunked_region(hook_mode):
     _test_core(chunked.run, hook_mode=hook_mode)
+
+
+@_cuda_only
+@pytest.mark.skipif(
+    not _device_module.is_available(),
+    reason="Device memory at two addresses requires a GPU",
+)
+@pytest.mark.parametrize("hook_mode", _HOOK_MODES)
+def test_map_chunks(hook_mode):
+    _test_core(map_chunks.run, hook_mode=hook_mode)
 
 
 @pytest.mark.skipif(

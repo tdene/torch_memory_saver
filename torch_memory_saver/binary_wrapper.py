@@ -88,6 +88,14 @@ def _setup_function_signatures(cdll):
             ctypes.c_size_t,
         ]
         cdll.tms_resume_chunks.restype = ctypes.c_int
+        cdll.tms_map_chunks.argtypes = [
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_size_t,
+        ]
+        cdll.tms_map_chunks.restype = ctypes.c_int
 
     # XPU-only symbols.
     if hasattr(cdll, "tms_xpu_prewarm_devices"):

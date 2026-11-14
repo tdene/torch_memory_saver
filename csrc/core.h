@@ -35,8 +35,14 @@ struct Chunk {
     // resume() pass a chunk without memory by; handle is valid while the allocation is active.
     bool own = false;
     CUmemGenericAllocationHandle handle = 0;
+    // Set by map_chunks: the chunk is mapped from chunk source_index of the allocation at
+    // source, whose memory it shares, whenever its own allocation is active.
+    void* source = nullptr;
+    size_t source_index = 0;
     // Where the chunk's bytes start in the allocation's cpu_backup slot, if they are in it.
     size_t backup_offset = kNoChunkBackup;
+
+    bool holds_memory() const { return own || source != nullptr; }
 };
 
 // What the chunk calls return. Anything but TMS_CHUNK_OK means that nothing changed; the
@@ -46,7 +52,14 @@ enum TmsChunkStatus : int {
     TMS_CHUNK_OUT_OF_MEMORY = 2,  // cudaErrorMemoryAllocation
     TMS_CHUNK_INDEX_OUT_OF_RANGE = -1,
     TMS_CHUNK_ALLOCATION_PAUSED = -2,
+    TMS_CHUNK_DESTINATION_HOLDS_MEMORY = -3,
+    TMS_CHUNK_SOURCE_WITHOUT_MEMORY = -4,
+    TMS_CHUNK_PAIR_MISMATCH = -5,
 };
+
+// What pause() and resume() return, with nothing changed, for a call against the order that
+// mapped chunks need: a tag that maps chunks is paused before their source, resumed after it.
+constexpr cudaError_t kMappedChunkOrder = cudaErrorInvalidValue;
 #endif
 
 struct AllocationMetadata {
@@ -112,6 +125,11 @@ public:
         size_t capacity);
     // Gives memory to the listed chunks that have none, all or nothing. Returns a TmsChunkStatus.
     int resume_chunks(const std::string& tag, const size_t* indices, size_t count);
+    // Maps the memory of source chunk i at the address of destination chunk i too, all or
+    // nothing. Returns a TmsChunkStatus.
+    int map_chunks(
+        const std::string& dst_tag, const size_t* dst_indices,
+        const std::string& src_tag, const size_t* src_indices, size_t count);
 #endif
 
     cudaError_t pause(const std::string& tag);

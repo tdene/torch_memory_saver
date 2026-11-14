@@ -52,6 +52,28 @@ allocate into it, for example under `torch.cuda.use_mem_pool(pool)`, inside
 `torch_memory_saver.tag_scope(tag=...)`, which sets the tag and the backup
 options like `region` but enters no pool.
 
+### Chunked Regions and Shared Memory
+
+On CUDA, `region(..., chunk_size=N)` backs each allocation with one device handle
+per `N` bytes, and `initially_released=True` makes allocations that reserve
+address space only. Chunks are addressed by tag:
+
+```python
+chunk = 32 * torch_memory_saver.get_allocation_granularity()
+with torch_memory_saver.region(tag="slots", chunk_size=chunk):
+    slots = torch.empty((4 * chunk,), dtype=torch.uint8, device='cuda')
+with torch_memory_saver.region(tag="cache", chunk_size=chunk, initially_released=True):
+    cache = torch.empty((6 * chunk,), dtype=torch.uint8, device='cuda')
+
+torch_memory_saver.resume_chunks("cache", [0, 1])                # memory of its own
+torch_memory_saver.map_chunks("cache", [4, 5], "slots", [3, 2])  # the memory of "slots"
+torch_memory_saver.get_chunk_layout("cache")  # [(address, size), ...]
+torch_memory_saver.get_chunk_states("cache")  # [True, True, False, False, True, True]
+```
+
+A mapped chunk is the device memory of its source at a second address. Pause the
+tag that maps before the tag that owns the memory, and resume it after.
+
 ### Release Memory in CUDA Graph
 
 Not only does torch_memory_saver make tensors compatible with CUDA graph, but we can also release the memory held by CUDA graph (i.e. the intermediate tensors).

@@ -77,3 +77,52 @@ def test_resume_chunks_status(status, error):
             _TorchMemorySaverImpl.resume_chunks(impl, "kv", [3, 1])
         assert caught.type is error
     assert seen == [(b"kv", [3, 1])]
+
+
+@pytest.mark.parametrize(
+    "status, error",
+    [(0, None), (2, torch.OutOfMemoryError), (-1, IndexError), (-2, RuntimeError),
+     (-3, ValueError), (-4, ValueError), (-5, ValueError)],
+)
+def test_map_chunks_status(status, error):
+    seen = []
+
+    def map_chunks(dst_tag, dst_indices, src_tag, src_indices, count):
+        seen.append((dst_tag, list(dst_indices[:count]), src_tag, list(src_indices[:count])))
+        return status
+
+    impl = _chunk_impl(tms_map_chunks=map_chunks)
+    if error is None:
+        _TorchMemorySaverImpl.map_chunks(impl, "kv", [6, 7], "mamba", [1, 0])
+    else:
+        with pytest.raises(error, match="nothing was changed") as caught:
+            _TorchMemorySaverImpl.map_chunks(impl, "kv", [6, 7], "mamba", [1, 0])
+        assert caught.type is error
+    assert seen == [(b"kv", [6, 7], b"mamba", [1, 0])]
+
+    # Lists of different lengths never reach the hook.
+    with pytest.raises(ValueError, match="2 destination chunks for 1 source chunks"):
+        _TorchMemorySaverImpl.map_chunks(impl, "kv", [6, 7], "mamba", [1])
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize("call", ["pause", "resume"])
+@pytest.mark.parametrize("status, error", [(0, None), (1, RuntimeError), (2, torch.OutOfMemoryError)])
+def test_pause_resume_status(call, status, error):
+    if call == "pause" and status == 2:
+        error = None  # pause() has no out of memory
+    cdll = SimpleNamespace(
+        **{f"tms_{call}": lambda tag: status, "tms_affected_devices": lambda *args: 0}
+    )
+    impl = SimpleNamespace(
+        _binary_wrapper=SimpleNamespace(cdll=cdll),
+        _is_xpu=False,
+        _sync_affected_devices=lambda tag: None,
+    )
+    method = getattr(_TorchMemorySaverImpl, call)
+    if error is None:
+        method(impl, "kv")
+    else:
+        with pytest.raises(error) as caught:
+            method(impl, "kv")
+        assert caught.type is error
