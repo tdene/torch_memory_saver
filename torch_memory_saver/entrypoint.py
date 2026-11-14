@@ -45,6 +45,7 @@ class TorchMemorySaver:
         enable_cpu_backup: bool = False,
         enable_disk_backup: bool = False,
         cpu_backup_backend: Optional[CpuBackupBackend] = None,
+        initially_released: bool = False,
     ):
         """Context manager for memory saving with optional tag.
 
@@ -57,6 +58,11 @@ class TorchMemorySaver:
         "pinned" (default; cudaMallocHost/hipHostMalloc/musaMallocHost) or "mmap"
         (reclaimable RSS on CUDA/MUSA). ROCm is pinned-only. XPU uses pageable
         malloc and does not take cpu_backup_backend.
+
+        initially_released (CUDA only): the region's allocations reserve address
+        space only. Each is born paused, with no device memory and no backup, and
+        resume(tag) gives it memory. Create tensors in such a region with
+        torch.empty: nothing may write to them before the resume.
         """
         self._validate_cpu_backup_backend(enable_cpu_backup, cpu_backup_backend)
         self._ensure_initialized()
@@ -67,6 +73,7 @@ class TorchMemorySaver:
             enable_cpu_backup=enable_cpu_backup,
             enable_disk_backup=enable_disk_backup,
             cpu_backup_backend=cpu_backup_backend,
+            initially_released=initially_released,
         ):
             yield
 
@@ -317,12 +324,25 @@ class _TorchMemorySaverImpl:
         enable_cpu_backup: bool,
         enable_disk_backup: bool,
         cpu_backup_backend: Optional[CpuBackupBackend],
+        initially_released: bool = False,
     ):
         if self._is_xpu and enable_disk_backup:
             raise NotImplementedError(
                 "TorchMemorySaver disk backup (enable_disk_backup=True) is not "
                 "supported on Intel XPU; use enable_cpu_backup=True instead."
             )
+        if initially_released:
+            if not _is_cuda_build():
+                raise NotImplementedError("initially_released is only supported on CUDA")
+            if (
+                torch.are_deterministic_algorithms_enabled()
+                and torch.utils.deterministic.fill_uninitialized_memory
+            ):
+                raise RuntimeError(
+                    "An initially_released region cannot be used while deterministic "
+                    "algorithms fill uninitialized memory: torch.empty would write to "
+                    "address space that has no device memory"
+                )
         # See https://github.com/fzyzcjy/torch_memory_saver/pull/20#issuecomment-3047099047
         # Key by device too: a MemPool is bound to its creation device, so a
         # multi-device process must not reuse one device's pool on another.
@@ -341,6 +361,9 @@ class _TorchMemorySaverImpl:
             resolved_cpu_backup_backend,
             device,
         )
+        if initially_released:
+            # Pools of its own; the key of an ordinary region stays as it was.
+            key += (initially_released,)
         mem_pool = self._mem_pools[key]
         with self._device_module.use_mem_pool(mem_pool):
             with self._with_region_config(
@@ -348,6 +371,7 @@ class _TorchMemorySaverImpl:
                 enable_cpu_backup=enable_cpu_backup,
                 enable_disk_backup=enable_disk_backup,
                 cpu_backup_backend=cpu_backup_backend,
+                initially_released=initially_released,
             ):
                 yield
 
@@ -385,6 +409,7 @@ class _TorchMemorySaverImpl:
         enable_cpu_backup: bool,
         cpu_backup_backend: Optional[CpuBackupBackend],
         enable_disk_backup: bool = False,
+        initially_released: bool = False,
     ):
         cdll = self._binary_wrapper.cdll
         orig_tag = cdll.tms_get_current_tag().decode("utf-8")
@@ -392,6 +417,7 @@ class _TorchMemorySaverImpl:
         orig_enable_cpu_backup = cdll.tms_get_enable_cpu_backup()
         orig_cpu_backup_backend = cdll.tms_get_cpu_backup_backend().decode("utf-8")
         orig_enable_disk_backup = cdll.tms_get_enable_disk_backup()
+        orig_initially_released = _is_cuda_build() and cdll.tms_get_initially_released()
         expected_cpu_backup_backend = cpu_backup_backend or orig_cpu_backup_backend
 
         self._binary_wrapper.set_config(
@@ -400,6 +426,7 @@ class _TorchMemorySaverImpl:
             enable_cpu_backup=enable_cpu_backup,
             cpu_backup_backend=cpu_backup_backend,
             enable_disk_backup=enable_disk_backup,
+            initially_released=initially_released,
         )
 
         if self._is_musa:
@@ -426,6 +453,7 @@ class _TorchMemorySaverImpl:
                 enable_cpu_backup=orig_enable_cpu_backup,
                 cpu_backup_backend=orig_cpu_backup_backend,
                 enable_disk_backup=orig_enable_disk_backup,
+                initially_released=orig_initially_released,
             )
 
     @contextmanager

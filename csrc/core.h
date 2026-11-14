@@ -48,6 +48,8 @@ struct AllocationMetadata {
     // CUDA, ROCm 7.0+ and MUSA: Single allocation handle
     size_t allocation_size;
     CUmemGenericAllocationHandle allocHandle;
+    // Born paused by an initially_released region and not resumed yet: there is no backup.
+    bool born_released = false;
 #endif
 };
 
@@ -62,7 +64,8 @@ public:
         const std::string& tag,
         bool enable_cpu_backup,
         CpuBackupKind cpu_backup_kind,
-        bool enable_disk_backup);
+        bool enable_disk_backup,
+        bool initially_released = false);
     cudaError_t free(void *ptr);
 
     cudaError_t pause(const std::string& tag);

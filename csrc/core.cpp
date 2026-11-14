@@ -93,7 +93,8 @@ cudaError_t TorchMemorySaver::malloc(
     const std::string& tag,
     const bool enable_cpu_backup,
     const CpuBackupKind cpu_backup_kind,
-    const bool enable_disk_backup) {
+    const bool enable_disk_backup,
+    const bool initially_released) {
     // Enforce here, not only in the Python layer: an assert is stripped under
     // python -O and bypassed by direct C-API / env-var use.
     SIMPLE_CHECK(!(enable_cpu_backup && enable_disk_backup),
@@ -116,6 +117,26 @@ cudaError_t TorchMemorySaver::malloc(
 
 #else
     const size_t allocation_size = CUDAUtils::cu_mem_get_allocation_size(raw_size, device);
+#if defined(USE_CUDA)
+    if (initially_released) {
+        // Address space only: no device memory is requested, so the margin does not apply.
+        void *address = nullptr;
+        const cudaError_t reserve_ret = try_reserve(
+            &address, CUDAUtils::cu_mem_get_reserve_size(allocation_size, device));
+        if (reserve_ret != cudaSuccess) {
+            return reserve_ret;
+        }
+        *ptr = address;
+        const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+        allocation_metadata_.emplace(
+            address,
+            AllocationMetadata{
+                raw_size, device, tag, AllocationState::PAUSED,
+                enable_cpu_backup, CpuBackupSlot{cpu_backup_kind, nullptr, 0},
+                enable_disk_backup, DiskBackupSlot{}, allocation_size, 0, true});
+        return cudaSuccess;
+    }
+#endif
     const uint64_t memory_margin_bytes = memory_margin_bytes_.load();
     if (memory_margin_bytes > 0) {
         size_t free_bytes, total_bytes;
@@ -406,7 +427,9 @@ cudaError_t TorchMemorySaver::resume(const std::string& tag) {
         }
 #endif
 
-        if (metadata.enable_cpu_backup) {
+        if (metadata.born_released) {
+            metadata.born_released = false;
+        } else if (metadata.enable_cpu_backup) {
             cpu_backuper::onload(
                 ptr, metadata.raw_size, metadata.device, metadata.cpu_backup);
             if (!retain_cpu_backup) {

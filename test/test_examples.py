@@ -32,6 +32,7 @@ from examples import (
     malloc_oom,
     release_region_pools,
     tag_scope_shared_pool,
+    initially_released,
 )
 
 # XPU only supports hook_mode='torch'; MUSA supports both hook modes.
@@ -309,6 +310,16 @@ def test_tag_scope_shared_pool(hook_mode):
             check=True,
             timeout=300,
         )
+
+
+@_cuda_only
+@pytest.mark.skipif(
+    not _device_module.is_available(),
+    reason="A region without device memory requires a GPU",
+)
+@pytest.mark.parametrize("hook_mode", _HOOK_MODES)
+def test_initially_released(hook_mode):
+    _test_core(initially_released.run, hook_mode=hook_mode)
 
 
 @pytest.mark.skipif(

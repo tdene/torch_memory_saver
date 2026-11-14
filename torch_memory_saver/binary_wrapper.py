@@ -23,6 +23,7 @@ class BinaryWrapper:
         enable_cpu_backup: bool,
         cpu_backup_backend: Optional[str] = None,
         enable_disk_backup: bool = False,
+        initially_released: bool = False,
     ):
         self.cdll.tms_set_current_tag(tag.encode("utf-8"))
         self.cdll.tms_set_interesting_region(interesting_region)
@@ -30,6 +31,8 @@ class BinaryWrapper:
         if cpu_backup_backend is not None:
             self.cdll.tms_set_cpu_backup_backend(cpu_backup_backend.encode("utf-8"))
         self.cdll.tms_set_enable_disk_backup(enable_disk_backup)
+        if hasattr(self.cdll, "tms_set_initially_released"):
+            self.cdll.tms_set_initially_released(initially_released)
 
 
 def _setup_function_signatures(cdll):
@@ -65,6 +68,8 @@ def _setup_function_signatures(cdll):
     if hasattr(cdll, "tms_get_allocation_granularity"):
         cdll.tms_get_allocation_granularity.argtypes = [ctypes.c_int]
         cdll.tms_get_allocation_granularity.restype = ctypes.c_size_t
+        cdll.tms_set_initially_released.argtypes = [ctypes.c_bool]
+        cdll.tms_get_initially_released.restype = ctypes.c_bool
 
     # XPU-only symbols.
     if hasattr(cdll, "tms_xpu_prewarm_devices"):

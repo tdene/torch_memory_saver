@@ -55,6 +55,9 @@ public:
         enable_disk_backup_ = value;
     }
 
+    // Set through a CUDA-only entrypoint: the region's allocations reserve address space only.
+    bool initially_released_ = false;
+
 private:
     std::optional<bool> is_interesting_region_;
     std::optional<bool> enable_cpu_backup_;
@@ -77,7 +80,7 @@ cudaError_t cudaMalloc(void **ptr, size_t size) {
         return TorchMemorySaver::instance().malloc(
             ptr, CUDAUtils::cu_ctx_get_device(), size, thread_local_config.current_tag_,
             thread_local_config.enable_cpu_backup(), thread_local_config.cpu_backup_kind(),
-            thread_local_config.enable_disk_backup());
+            thread_local_config.enable_disk_backup(), thread_local_config.initially_released_);
     } else {
         return APIForwarder::call_real_cuda_malloc(ptr, size);
     }
@@ -102,7 +105,7 @@ void *tms_torch_malloc(ssize_t size, int device, cudaStream_t stream) {
     const cudaError_t ret = TorchMemorySaver::instance().malloc(
         &ptr, CUDAUtils::cu_device_get(device), size, thread_local_config.current_tag_,
         thread_local_config.enable_cpu_backup(), thread_local_config.cpu_backup_kind(),
-        thread_local_config.enable_disk_backup());
+        thread_local_config.enable_disk_backup(), thread_local_config.initially_released_);
     if (ret == cudaErrorMemoryAllocation) {
         // PyTorch takes a null segment for out of memory and raises torch.OutOfMemoryError.
         return nullptr;
@@ -221,6 +224,14 @@ uint8_t* tms_get_cpu_backup_pointer(const uint8_t* gpu_ptr, uint64_t size) {
 #if defined(USE_CUDA)
 size_t tms_get_allocation_granularity(int device) {
     return CUDAUtils::cu_mem_get_allocation_size(1, CUDAUtils::cu_device_get(device));
+}
+
+void tms_set_initially_released(bool initially_released) {
+    thread_local_config.initially_released_ = initially_released;
+}
+
+bool tms_get_initially_released() {
+    return thread_local_config.initially_released_;
 }
 #endif
 
