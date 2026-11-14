@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 _TAG_DEFAULT = "default"
 CpuBackupBackend = Literal["mmap", "pinned"]
+# torch.OutOfMemoryError, which older PyTorch has only as torch.cuda.OutOfMemoryError.
+_OutOfMemoryError = getattr(torch, "OutOfMemoryError", torch.cuda.OutOfMemoryError)
 
 
 class TorchMemorySaver:
@@ -86,7 +88,12 @@ class TorchMemorySaver:
         self._impl.pause(tag=tag)
 
     def resume(self, tag: Optional[str] = None):
-        """Resume memory for specific tag or all memory if tag is None"""
+        """Resume memory for specific tag or all memory if tag is None
+
+        On CUDA, raises torch.OutOfMemoryError when the device has no memory for
+        the paused allocations: all of them stay paused with their backups, and
+        the call can be repeated once device memory is free.
+        """
         self._ensure_initialized()
         self._impl.resume(tag=tag)
 
@@ -409,6 +416,12 @@ class _TorchMemorySaverImpl:
                     "resolving the failure (e.g. free device memory)."
                 )
             self._sync_affected_devices(tag)
+        elif ret != 0:
+            raise _OutOfMemoryError(
+                f"torch_memory_saver.resume(tag={tag!r}) ran out of device memory "
+                f"(code {ret}). Every matching allocation is still paused and keeps "
+                "its backup; free device memory and call resume() again."
+            )
 
     def _sync_affected_devices(self, tag: Optional[str]):
         for device in self._affected_devices(tag):

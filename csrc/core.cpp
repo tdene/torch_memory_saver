@@ -9,6 +9,61 @@
 #include <algorithm>
 #include <set>
 
+#if defined(USE_CUDA)
+namespace {
+
+// cuMemMap documents CUDA_ERROR_OUT_OF_MEMORY like cuMemCreate does. Only that result is
+// handed back, as cu_mem_create does; anything else stays fatal.
+cudaError_t try_map(void *ptr, size_t size, CUmemGenericAllocationHandle handle, CUdevice device) {
+    const CUresult ret = cuMemMap((CUdeviceptr) ptr, size, 0, handle, 0);
+    if (ret == CUDA_ERROR_OUT_OF_MEMORY) {
+        std::cerr << "[torch_memory_saver.cpp] cuMemMap CUDA_ERROR_OUT_OF_MEMORY" << std::endl;
+        return cudaErrorMemoryAllocation;
+    }
+    CURESULT_CHECK(ret);
+    CUDAUtils::cu_mem_set_access(ptr, size, device);
+    return cudaSuccess;
+}
+
+// One address range that a call has to back with a handle of its own.
+struct PendingMapping {
+    void *address;
+    size_t size;
+    CUdevice device;
+    CUmemGenericAllocationHandle handle = 0;
+    bool created = false;
+    bool mapped = false;
+};
+
+// All or nothing: on out of memory the mappings made by this call are removed again.
+cudaError_t map_all(std::vector<PendingMapping> &pending) {
+    for (PendingMapping &mapping : pending) {
+        const cudaError_t ret = try_map(mapping.address, mapping.size, mapping.handle, mapping.device);
+        if (ret != cudaSuccess) {
+            for (PendingMapping &done : pending) {
+                if (done.mapped) {
+                    CURESULT_CHECK(cuMemUnmap((CUdeviceptr) done.address, done.size));
+                    done.mapped = false;
+                }
+            }
+            return ret;
+        }
+        mapping.mapped = true;
+    }
+    return cudaSuccess;
+}
+
+void release_created(const std::vector<PendingMapping> &pending) {
+    for (const PendingMapping &mapping : pending) {
+        if (mapping.created) {
+            CURESULT_CHECK(cuMemRelease(mapping.handle));
+        }
+    }
+}
+
+}  // namespace
+#endif
+
 TorchMemorySaver::TorchMemorySaver()
     : disk_backend_(compute_disk_backup_dir_from_env(), compute_disk_chunk_bytes_from_env()) {
 #if TMS_SUPPORTS_RETAIN_CPU_BACKUP
@@ -243,6 +298,46 @@ cudaError_t TorchMemorySaver::resume(const std::string& tag) {
     const std::lock_guard <std::mutex> lock(allocator_metadata_mutex_);
     const bool retain_cpu_backup = retain_cpu_backup_.load();
 
+#if defined(USE_CUDA)
+    // Every handle is created and mapped before a backup or a state is touched: out of memory
+    // leaves every matching allocation paused with its backup, and the call can be repeated.
+    std::vector<PendingMapping> pending;
+    for (const auto &kv : allocation_metadata_) {
+        const AllocationMetadata &metadata = kv.second;
+
+        if (!tag.empty() && metadata.tag != tag) {
+            continue;
+        }
+
+        // Checked for all of them before memory is requested, so that a tag in a wrong state
+        // is not reported as out of memory when memory is short.
+        if (metadata.state != AllocationState::PAUSED) {
+            std::cerr << "[torch_memory_saver.cpp] Cannot resume allocation that is not paused. "
+                      << " tag=" << metadata.tag << " ptr=" << std::to_string((uintptr_t)kv.first)
+                      << " file=" << __FILE__ << " func=" << __func__ << " line=" << __LINE__
+                      << std::endl;
+            exit(1);
+        }
+
+        pending.push_back(PendingMapping{kv.first, metadata.allocation_size, metadata.device});
+    }
+    for (PendingMapping &mapping : pending) {
+        const cudaError_t ret = CUDAUtils::cu_mem_create(&mapping.handle, mapping.size, mapping.device);
+        if (ret != cudaSuccess) {
+            release_created(pending);
+            return ret;
+        }
+        mapping.created = true;
+    }
+    const cudaError_t map_ret = map_all(pending);
+    if (map_ret != cudaSuccess) {
+        release_created(pending);
+        return map_ret;
+    }
+    // The loop below visits the allocations in the same order: the map is not modified in between.
+    size_t next_pending = 0;
+#endif
+
     for (auto it = allocation_metadata_.begin(); it != allocation_metadata_.end(); ++it) {
         void *ptr = it->first;
         AllocationMetadata &metadata = it->second;
@@ -260,6 +355,9 @@ cudaError_t TorchMemorySaver::resume(const std::string& tag) {
         }
 
         CUmemGenericAllocationHandle newAllocHandle;
+#if defined(USE_CUDA)
+        newAllocHandle = pending[next_pending++].handle;
+#else
         CUDA_ERROR_CHECK(CUDAUtils::cu_mem_create(
             &newAllocHandle, metadata.allocation_size, metadata.device));
 
@@ -267,6 +365,7 @@ cudaError_t TorchMemorySaver::resume(const std::string& tag) {
             (CUdeviceptr) ptr, metadata.allocation_size, 0, newAllocHandle, 0));
 
         CUDAUtils::cu_mem_set_access(ptr, metadata.allocation_size, metadata.device);
+#endif
 
 #if defined(USE_MUSA)
         // MUSA may hand back non-zero pages for a fresh mapping, so zero a
