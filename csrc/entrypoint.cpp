@@ -55,8 +55,10 @@ public:
         enable_disk_backup_ = value;
     }
 
-    // Set through a CUDA-only entrypoint: the region's allocations reserve address space only.
+    // Set through CUDA-only entrypoints. initially_released_: the region's allocations
+    // reserve address space only. chunk_size_ > 0: each is backed by one handle per chunk.
     bool initially_released_ = false;
+    size_t chunk_size_ = 0;
 
 private:
     std::optional<bool> is_interesting_region_;
@@ -80,7 +82,8 @@ cudaError_t cudaMalloc(void **ptr, size_t size) {
         return TorchMemorySaver::instance().malloc(
             ptr, CUDAUtils::cu_ctx_get_device(), size, thread_local_config.current_tag_,
             thread_local_config.enable_cpu_backup(), thread_local_config.cpu_backup_kind(),
-            thread_local_config.enable_disk_backup(), thread_local_config.initially_released_);
+            thread_local_config.enable_disk_backup(), thread_local_config.initially_released_,
+            thread_local_config.chunk_size_);
     } else {
         return APIForwarder::call_real_cuda_malloc(ptr, size);
     }
@@ -105,7 +108,8 @@ void *tms_torch_malloc(ssize_t size, int device, cudaStream_t stream) {
     const cudaError_t ret = TorchMemorySaver::instance().malloc(
         &ptr, CUDAUtils::cu_device_get(device), size, thread_local_config.current_tag_,
         thread_local_config.enable_cpu_backup(), thread_local_config.cpu_backup_kind(),
-        thread_local_config.enable_disk_backup(), thread_local_config.initially_released_);
+        thread_local_config.enable_disk_backup(), thread_local_config.initially_released_,
+        thread_local_config.chunk_size_);
     if (ret == cudaErrorMemoryAllocation) {
         // PyTorch takes a null segment for out of memory and raises torch.OutOfMemoryError.
         return nullptr;
@@ -232,6 +236,25 @@ void tms_set_initially_released(bool initially_released) {
 
 bool tms_get_initially_released() {
     return thread_local_config.initially_released_;
+}
+
+void tms_set_chunk_size(size_t chunk_size) {
+    thread_local_config.chunk_size_ = chunk_size;
+}
+
+size_t tms_get_chunk_size() {
+    return thread_local_config.chunk_size_;
+}
+
+size_t tms_get_chunk_layout(
+    const char* tag, uint64_t* out_addresses, size_t* out_sizes, uint8_t* out_states,
+    size_t capacity) {
+    return TorchMemorySaver::instance().get_chunk_layout(
+        tag, out_addresses, out_sizes, out_states, capacity);
+}
+
+int tms_resume_chunks(const char* tag, const size_t* indices, size_t count) {
+    return TorchMemorySaver::instance().resume_chunks(tag, indices, count);
 }
 #endif
 

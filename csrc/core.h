@@ -26,6 +26,29 @@ enum class AllocationState {
 #include "hardware_xpu_support.h"
 #endif
 
+#if defined(USE_CUDA)
+constexpr size_t kNoChunkBackup = static_cast<size_t>(-1);
+
+// One chunk of an allocation that a region with chunk_size made.
+struct Chunk {
+    // The chunk has device memory of its own whenever its allocation is active. pause() and
+    // resume() pass a chunk without memory by; handle is valid while the allocation is active.
+    bool own = false;
+    CUmemGenericAllocationHandle handle = 0;
+    // Where the chunk's bytes start in the allocation's cpu_backup slot, if they are in it.
+    size_t backup_offset = kNoChunkBackup;
+};
+
+// What the chunk calls return. Anything but TMS_CHUNK_OK means that nothing changed; the
+// negative ones are errors of the caller.
+enum TmsChunkStatus : int {
+    TMS_CHUNK_OK = 0,
+    TMS_CHUNK_OUT_OF_MEMORY = 2,  // cudaErrorMemoryAllocation
+    TMS_CHUNK_INDEX_OUT_OF_RANGE = -1,
+    TMS_CHUNK_ALLOCATION_PAUSED = -2,
+};
+#endif
+
 struct AllocationMetadata {
     size_t raw_size;
     CUdevice device;
@@ -50,6 +73,16 @@ struct AllocationMetadata {
     CUmemGenericAllocationHandle allocHandle;
     // Born paused by an initially_released region and not resumed yet: there is no backup.
     bool born_released = false;
+#if defined(USE_CUDA)
+    // An allocation of a region with chunk_size: chunk i covers
+    // [i * chunk_size, min((i + 1) * chunk_size, allocation_size)), allocHandle is unused and
+    // cpu_backup packs the chunks that held memory at pause() in index order. chunk_size is 0
+    // and chunks is empty for every other allocation.
+    size_t chunk_size = 0;
+    std::vector<Chunk> chunks = {};
+    // Order of allocation: numbers the chunks of a tag across its allocations.
+    uint64_t sequence = 0;
+#endif
 #endif
 };
 
@@ -65,8 +98,21 @@ public:
         bool enable_cpu_backup,
         CpuBackupKind cpu_backup_kind,
         bool enable_disk_backup,
-        bool initially_released = false);
+        bool initially_released = false,
+        size_t chunk_size = 0);
     cudaError_t free(void *ptr);
+
+#if defined(USE_CUDA)
+    // The chunk calls address the chunked allocations of one tag. Its chunks are numbered
+    // across those allocations in the order they were made.
+    // Fills up to `capacity` entries and returns the number of chunks. A state is 1 for a
+    // chunk that holds memory now.
+    size_t get_chunk_layout(
+        const std::string& tag, uint64_t* out_addresses, size_t* out_sizes, uint8_t* out_states,
+        size_t capacity);
+    // Gives memory to the listed chunks that have none, all or nothing. Returns a TmsChunkStatus.
+    int resume_chunks(const std::string& tag, const size_t* indices, size_t count);
+#endif
 
     cudaError_t pause(const std::string& tag);
     cudaError_t resume(const std::string& tag);
@@ -108,6 +154,20 @@ private:
     ~TorchMemorySaver() = default;
     TorchMemorySaver(const TorchMemorySaver&) = delete;
     TorchMemorySaver& operator=(const TorchMemorySaver&) = delete;
+
+#if defined(USE_CUDA)
+    struct ChunkRef {
+        void* base;
+        AllocationMetadata* metadata;
+        size_t index;
+    };
+    cudaError_t malloc_chunked(void** ptr, AllocationMetadata metadata, bool initially_released);
+    // Every chunk of the tag, in the order of the chunk calls. The caller holds
+    // allocator_metadata_mutex_.
+    std::vector<ChunkRef> chunks_of_tag(const std::string& tag);
+    // Guarded by allocator_metadata_mutex_.
+    uint64_t next_sequence_ = 0;
+#endif
 
     std::mutex allocator_metadata_mutex_;
     std::unordered_map<void*, AllocationMetadata> allocation_metadata_;

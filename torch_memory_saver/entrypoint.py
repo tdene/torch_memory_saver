@@ -7,7 +7,7 @@ import logging
 import os
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import Literal, Optional
+from typing import Literal, Optional, Sequence
 import torch
 
 from .binary_wrapper import BinaryWrapper
@@ -23,6 +23,20 @@ _OutOfMemoryError = getattr(torch, "OutOfMemoryError", torch.cuda.OutOfMemoryErr
 # Up to PyTorch 2.7 a segment that a tensor still occupies when its pool is dropped is later
 # returned with cudaFree, not through the pool's allocator, which torch-mode memory needs.
 _MIN_TORCH_FOR_POOL_RELEASE = (2, 8)
+
+
+# TmsChunkStatus in csrc/core.h: why a chunk call was refused.
+_CHUNK_ERRORS = {
+    2: (_OutOfMemoryError, "the device has no memory for the chunks"),
+    -1: (IndexError, "a chunk index is out of range for the tag"),
+    -2: (RuntimeError, "an allocation of the tag is paused"),
+}
+
+
+def _raise_for_chunk_status(status: int, call: str) -> None:
+    if status != 0:
+        error, reason = _CHUNK_ERRORS[status]
+        raise error(f"torch_memory_saver.{call}: {reason}; nothing was changed")
 
 
 def _is_cuda_build() -> bool:
@@ -45,6 +59,7 @@ class TorchMemorySaver:
         enable_cpu_backup: bool = False,
         enable_disk_backup: bool = False,
         cpu_backup_backend: Optional[CpuBackupBackend] = None,
+        chunk_size: int = 0,
         initially_released: bool = False,
     ):
         """Context manager for memory saving with optional tag.
@@ -59,10 +74,21 @@ class TorchMemorySaver:
         (reclaimable RSS on CUDA/MUSA). ROCm is pinned-only. XPU uses pageable
         malloc and does not take cpu_backup_backend.
 
+        chunk_size (CUDA only): each allocation of the region is one address range
+        backed by one device handle per chunk_size bytes; the last chunk is shorter
+        when the size is no multiple. It must be a multiple of
+        get_allocation_granularity() and applies to every allocation made in the
+        region, PyTorch's pool segments included. pause(tag) and resume(tag) treat
+        such an allocation as a whole and pass chunks without memory by;
+        get_chunk_layout(), get_chunk_states() and resume_chunks() address its
+        chunks by tag. No disk backup.
+
         initially_released (CUDA only): the region's allocations reserve address
         space only. Each is born paused, with no device memory and no backup, and
-        resume(tag) gives it memory. Create tensors in such a region with
-        torch.empty: nothing may write to them before the resume.
+        resume(tag) gives it memory. With chunk_size it is born active with no
+        chunk holding memory, and resume_chunks() gives memory to the chunks that
+        are used. Create tensors in such a region with torch.empty: nothing may
+        write to them before they have memory.
         """
         self._validate_cpu_backup_backend(enable_cpu_backup, cpu_backup_backend)
         self._ensure_initialized()
@@ -73,6 +99,7 @@ class TorchMemorySaver:
             enable_cpu_backup=enable_cpu_backup,
             enable_disk_backup=enable_disk_backup,
             cpu_backup_backend=cpu_backup_backend,
+            chunk_size=chunk_size,
             initially_released=initially_released,
         ):
             yield
@@ -126,6 +153,34 @@ class TorchMemorySaver:
         self._ensure_initialized()
         return self._impl.get_allocation_granularity(device)
 
+    def get_chunk_layout(self, tag: str) -> list[tuple[int, int]]:
+        """(address, size) of every chunk of the tag's chunked allocations.
+
+        A tag names one chunked allocation, or the segments of one pool: its chunks
+        are numbered across its allocations in the order those were made, and
+        these numbers are the chunk indices of the other chunk calls. CUDA only.
+        """
+        self._ensure_initialized()
+        addresses, sizes, _ = self._impl.chunk_table(tag)
+        return list(zip(addresses, sizes))
+
+    def get_chunk_states(self, tag: str) -> list[bool]:
+        """One flag per chunk of the tag, in get_chunk_layout() order: True for a
+        chunk that holds device memory now. CUDA only."""
+        self._ensure_initialized()
+        return self._impl.chunk_table(tag)[2]
+
+    def resume_chunks(self, tag: str, chunk_indices: Sequence[int]) -> None:
+        """Give device memory to the listed chunks of the tag that have none.
+
+        All or nothing: raises torch.OutOfMemoryError, with no chunk changed, when
+        the device has no memory for all of them. The contents of the new memory
+        are undefined. Raises IndexError for an index outside the tag's chunks and
+        RuntimeError while the tag is paused. CUDA only.
+        """
+        self._ensure_initialized()
+        self._impl.resume_chunks(tag, chunk_indices)
+
     def release_region_pools(self, tag: Optional[str] = None) -> int:
         """Drop the memory pools of the regions of one tag (None: of every tag) and
         return how many were dropped.
@@ -156,9 +211,10 @@ class TorchMemorySaver:
         enable_cpu_backup: bool = False,
         enable_disk_backup: bool = False,
         cpu_backup_backend: Optional[CpuBackupBackend] = None,
+        chunk_size: int = 0,
     ):
-        """region() without its memory pool: only the tag and the backup settings
-        of the calling thread, with the meaning they have for region().
+        """region() without its memory pool: only the tag, the backup settings and
+        chunk_size of the calling thread, with the meaning they have for region().
 
         Memory that reaches torch_memory_saver while the scope is open gets them,
         whichever pool it is allocated into. Entering a pool is left to the
@@ -176,6 +232,7 @@ class TorchMemorySaver:
             enable_cpu_backup=enable_cpu_backup,
             enable_disk_backup=enable_disk_backup,
             cpu_backup_backend=cpu_backup_backend,
+            chunk_size=chunk_size,
         ):
             yield
 
@@ -324,6 +381,7 @@ class _TorchMemorySaverImpl:
         enable_cpu_backup: bool,
         enable_disk_backup: bool,
         cpu_backup_backend: Optional[CpuBackupBackend],
+        chunk_size: int = 0,
         initially_released: bool = False,
     ):
         if self._is_xpu and enable_disk_backup:
@@ -361,9 +419,9 @@ class _TorchMemorySaverImpl:
             resolved_cpu_backup_backend,
             device,
         )
-        if initially_released:
+        if chunk_size or initially_released:
             # Pools of its own; the key of an ordinary region stays as it was.
-            key += (initially_released,)
+            key += (chunk_size, initially_released)
         mem_pool = self._mem_pools[key]
         with self._device_module.use_mem_pool(mem_pool):
             with self._with_region_config(
@@ -371,6 +429,7 @@ class _TorchMemorySaverImpl:
                 enable_cpu_backup=enable_cpu_backup,
                 enable_disk_backup=enable_disk_backup,
                 cpu_backup_backend=cpu_backup_backend,
+                chunk_size=chunk_size,
                 initially_released=initially_released,
             ):
                 yield
@@ -409,8 +468,20 @@ class _TorchMemorySaverImpl:
         enable_cpu_backup: bool,
         cpu_backup_backend: Optional[CpuBackupBackend],
         enable_disk_backup: bool = False,
+        chunk_size: int = 0,
         initially_released: bool = False,
     ):
+        if chunk_size:
+            if not _is_cuda_build():
+                raise NotImplementedError("chunk_size is only supported on CUDA")
+            if enable_disk_backup:
+                raise ValueError("chunk_size cannot be combined with enable_disk_backup")
+            granularity = self.get_allocation_granularity(None)
+            if chunk_size < 0 or chunk_size % granularity:
+                raise ValueError(
+                    f"chunk_size={chunk_size} is not a positive multiple of the device "
+                    f"allocation granularity ({granularity} bytes)"
+                )
         cdll = self._binary_wrapper.cdll
         orig_tag = cdll.tms_get_current_tag().decode("utf-8")
         orig_interesting_region = cdll.tms_get_interesting_region()
@@ -418,6 +489,7 @@ class _TorchMemorySaverImpl:
         orig_cpu_backup_backend = cdll.tms_get_cpu_backup_backend().decode("utf-8")
         orig_enable_disk_backup = cdll.tms_get_enable_disk_backup()
         orig_initially_released = _is_cuda_build() and cdll.tms_get_initially_released()
+        orig_chunk_size = cdll.tms_get_chunk_size() if _is_cuda_build() else 0
         expected_cpu_backup_backend = cpu_backup_backend or orig_cpu_backup_backend
 
         self._binary_wrapper.set_config(
@@ -427,6 +499,7 @@ class _TorchMemorySaverImpl:
             cpu_backup_backend=cpu_backup_backend,
             enable_disk_backup=enable_disk_backup,
             initially_released=initially_released,
+            chunk_size=chunk_size,
         )
 
         if self._is_musa:
@@ -454,6 +527,7 @@ class _TorchMemorySaverImpl:
                 cpu_backup_backend=orig_cpu_backup_backend,
                 enable_disk_backup=orig_enable_disk_backup,
                 initially_released=orig_initially_released,
+                chunk_size=orig_chunk_size,
             )
 
     @contextmanager
@@ -557,6 +631,31 @@ class _TorchMemorySaverImpl:
         if not 0 <= device < device_count:
             raise ValueError(f"device {device} is outside [0, {device_count})")
         return cdll.tms_get_allocation_granularity(device)
+
+    def _chunk_cdll(self):
+        if not _is_cuda_build():
+            raise NotImplementedError("Chunked regions are only supported on CUDA")
+        return self._binary_wrapper.cdll
+
+    def chunk_table(self, tag: str) -> tuple[list[int], list[int], list[bool]]:
+        """Address, size and state of every chunk of the tag."""
+        get_layout = self._chunk_cdll().tms_get_chunk_layout
+        tag_bytes = tag.encode("utf-8")
+        count = get_layout(tag_bytes, None, None, None, 0)
+        while True:
+            addresses = (ctypes.c_uint64 * count)()
+            sizes = (ctypes.c_size_t * count)()
+            states = (ctypes.c_uint8 * count)()
+            found = get_layout(tag_bytes, addresses, sizes, states, count)
+            # Otherwise the tag gained or lost an allocation between the two calls.
+            if found == count:
+                return list(addresses), list(sizes), [bool(state) for state in states]
+            count = found
+
+    def resume_chunks(self, tag: str, chunk_indices: Sequence[int]) -> None:
+        indices = (ctypes.c_size_t * len(chunk_indices))(*chunk_indices)
+        status = self._chunk_cdll().tms_resume_chunks(tag.encode("utf-8"), indices, len(indices))
+        _raise_for_chunk_status(status, f"resume_chunks(tag={tag!r})")
 
     def release_region_pools(self, tag: Optional[str]) -> int:
         # A pool is named inside the comprehension only: the traceback of the error below keeps
