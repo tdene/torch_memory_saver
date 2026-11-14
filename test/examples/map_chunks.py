@@ -50,6 +50,10 @@ def run(hook_mode: str):
     def part(tensor, index):
         return tensor[index * chunk : (index + 1) * chunk]
 
+    # A process's first device operations take device memory of their own: run them on an
+    # ordinary tensor before the first reading.
+    normal_tensor = torch.full((1_000_000,), 100, dtype=torch.uint8, device=device)
+    assert _holds(normal_tensor, 100)
     free_start = free_bytes()
     with torch_memory_saver.region(tag=_TAG_SRC, enable_cpu_backup=True, chunk_size=chunk):
         src = torch.empty((4 * chunk,), dtype=torch.uint8, device=device)
@@ -128,7 +132,7 @@ def run(hook_mode: str):
     assert impl._affected_devices(_TAG_SRC) == []
     assert states(_TAG_DST) == [True, True, False, False, False, False]
     assert 2 * chunk <= free_start - free_bytes() < 2 * chunk + slack
-    assert _holds(dst[: 2 * chunk], 1)
+    assert _holds(dst[: 2 * chunk], 1) and _holds(normal_tensor, 100)
 
     # Return the region's memory before the interpreter exits: the tensor, then its pool.
     del dst
