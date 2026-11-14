@@ -12,8 +12,18 @@
 #if defined(USE_CUDA)
 namespace {
 
-// cuMemMap documents CUDA_ERROR_OUT_OF_MEMORY like cuMemCreate does. Only that result is
-// handed back, as cu_mem_create does; anything else stays fatal.
+// cuMemAddressReserve and cuMemMap document CUDA_ERROR_OUT_OF_MEMORY like cuMemCreate does.
+// Only that result is handed back, as cu_mem_create does; anything else stays fatal.
+cudaError_t try_reserve(void **ptr, size_t size) {
+    const CUresult ret = cuMemAddressReserve((CUdeviceptr *) ptr, size, 0, 0, 0);
+    if (ret == CUDA_ERROR_OUT_OF_MEMORY) {
+        std::cerr << "[torch_memory_saver.cpp] cuMemAddressReserve CUDA_ERROR_OUT_OF_MEMORY" << std::endl;
+        return cudaErrorMemoryAllocation;
+    }
+    CURESULT_CHECK(ret);
+    return cudaSuccess;
+}
+
 cudaError_t try_map(void *ptr, size_t size, CUmemGenericAllocationHandle handle, CUdevice device) {
     const CUresult ret = cuMemMap((CUdeviceptr) ptr, size, 0, handle, 0);
     if (ret == CUDA_ERROR_OUT_OF_MEMORY) {
@@ -127,10 +137,29 @@ cudaError_t TorchMemorySaver::malloc(
         return ret;
     }
 
+#if defined(USE_CUDA)
+    // Out of memory from the reserve or the map is returned like out of memory from the
+    // create: what the request obtained is given back and *ptr is not written.
+    const size_t reserve_size = CUDAUtils::cu_mem_get_reserve_size(allocation_size, device);
+    void *address = nullptr;
+    ret = try_reserve(&address, reserve_size);
+    if (ret != cudaSuccess) {
+        CURESULT_CHECK(cuMemRelease(allocHandle));
+        return ret;
+    }
+    ret = try_map(address, allocation_size, allocHandle, device);
+    if (ret != cudaSuccess) {
+        CURESULT_CHECK(cuMemAddressFree((CUdeviceptr) address, reserve_size));
+        CURESULT_CHECK(cuMemRelease(allocHandle));
+        return ret;
+    }
+    *ptr = address;
+#else
     CURESULT_CHECK(cuMemAddressReserve(
         (CUdeviceptr *) ptr, CUDAUtils::cu_mem_get_reserve_size(allocation_size, device), 0, 0, 0));
     CURESULT_CHECK(cuMemMap((CUdeviceptr) * ptr, allocation_size, 0, allocHandle, 0));
     CUDAUtils::cu_mem_set_access(*ptr, allocation_size, device);
+#endif
 
     {
         const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);

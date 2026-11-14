@@ -29,6 +29,7 @@ from examples import (
     free_outside_region,
     resume_oom,
     allocation_granularity,
+    malloc_oom,
 )
 
 # XPU only supports hook_mode='torch'; MUSA supports both hook modes.
@@ -255,6 +256,21 @@ def test_allocation_granularity(hook_mode):
             check=True,
             timeout=120,
         )
+
+
+@_cuda_only
+@pytest.mark.skipif(
+    not _device_module.is_available(),
+    reason="A region allocation without device memory requires a GPU",
+)
+def test_malloc_oom():
+    # The hook used to end the process at such an allocation: the child's exit status is the result.
+    subprocess.run(
+        [sys.executable, malloc_oom.__file__, "torch"],
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+        check=True,
+        timeout=120,
+    )
 
 
 @pytest.mark.skipif(

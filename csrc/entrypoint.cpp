@@ -98,10 +98,22 @@ void *tms_torch_malloc(ssize_t size, int device, cudaStream_t stream) {
 #endif
     SIMPLE_CHECK(thread_local_config.is_interesting_region(), "only support interesting region");
     void *ptr;
+#if defined(USE_CUDA)
+    const cudaError_t ret = TorchMemorySaver::instance().malloc(
+        &ptr, CUDAUtils::cu_device_get(device), size, thread_local_config.current_tag_,
+        thread_local_config.enable_cpu_backup(), thread_local_config.cpu_backup_kind(),
+        thread_local_config.enable_disk_backup());
+    if (ret == cudaErrorMemoryAllocation) {
+        // PyTorch takes a null segment for out of memory and raises torch.OutOfMemoryError.
+        return nullptr;
+    }
+    CUDA_ERROR_CHECK(ret);
+#else
     CUDA_ERROR_CHECK(TorchMemorySaver::instance().malloc(
         &ptr, CUDAUtils::cu_device_get(device), size, thread_local_config.current_tag_,
         thread_local_config.enable_cpu_backup(), thread_local_config.cpu_backup_kind(),
         thread_local_config.enable_disk_backup()));
+#endif
     return ptr;
 }
 
