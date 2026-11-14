@@ -26,6 +26,7 @@ from examples import (
     nested_region,
     pause_inflight,
     xpu_scenarios,
+    free_outside_region,
 )
 
 # XPU only supports hook_mode='torch'; MUSA supports both hook modes.
@@ -43,6 +44,10 @@ _skip_on_lupine = pytest.mark.skipif(
 )
 _xpu_only = pytest.mark.skipif(not _IS_XPU, reason="XPU-specific path")
 _rocm_only = pytest.mark.skipif(torch.version.hip is None, reason="ROCm-specific path")
+_cuda_only = pytest.mark.skipif(
+    _IS_XPU or _IS_MUSA or torch.version.hip is not None,
+    reason="CUDA-specific path",
+)
 _device_module = get_device_module()
 _multi_device_only = pytest.mark.skipif(
     _device_module.device_count() < 2,
@@ -197,6 +202,21 @@ def test_cuda_vmm_granularity():
 def test_rocm_vmm_adjacent_host_register():
     with change_env("TMS_INIT_ENABLE", "1"):
         _test_core(rocm_vmm_adjacent_host_register.run, hook_mode="preload")
+
+
+@_cuda_only
+@pytest.mark.skipif(
+    not _device_module.is_available(),
+    reason="Free outside a region requires a GPU",
+)
+def test_free_outside_region():
+    # The hook used to end the process at such a free: the child's exit status is the result.
+    subprocess.run(
+        [sys.executable, free_outside_region.__file__, "torch"],
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+        check=True,
+        timeout=120,
+    )
 
 
 @pytest.mark.skipif(
