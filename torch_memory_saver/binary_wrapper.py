@@ -23,6 +23,8 @@ class BinaryWrapper:
         enable_cpu_backup: bool,
         cpu_backup_backend: Optional[str] = None,
         enable_disk_backup: bool = False,
+        initially_released: bool = False,
+        chunk_size: int = 0,
     ):
         self.cdll.tms_set_current_tag(tag.encode("utf-8"))
         self.cdll.tms_set_interesting_region(interesting_region)
@@ -30,6 +32,9 @@ class BinaryWrapper:
         if cpu_backup_backend is not None:
             self.cdll.tms_set_cpu_backup_backend(cpu_backup_backend.encode("utf-8"))
         self.cdll.tms_set_enable_disk_backup(enable_disk_backup)
+        if hasattr(self.cdll, "tms_set_initially_released"):
+            self.cdll.tms_set_initially_released(initially_released)
+            self.cdll.tms_set_chunk_size(chunk_size)
 
 
 def _setup_function_signatures(cdll):
@@ -60,6 +65,37 @@ def _setup_function_signatures(cdll):
     cdll.tms_get_retain_cpu_backup.restype = ctypes.c_bool
     cdll.tms_get_cpu_backup_pointer.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint64]
     cdll.tms_get_cpu_backup_pointer.restype = ctypes.POINTER(ctypes.c_uint8)
+
+    # CUDA-only symbols.
+    if hasattr(cdll, "tms_get_allocation_granularity"):
+        cdll.tms_get_allocation_granularity.argtypes = [ctypes.c_int]
+        cdll.tms_get_allocation_granularity.restype = ctypes.c_size_t
+        cdll.tms_set_initially_released.argtypes = [ctypes.c_bool]
+        cdll.tms_get_initially_released.restype = ctypes.c_bool
+        cdll.tms_set_chunk_size.argtypes = [ctypes.c_size_t]
+        cdll.tms_get_chunk_size.restype = ctypes.c_size_t
+        cdll.tms_get_chunk_layout.argtypes = [
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_size_t,
+        ]
+        cdll.tms_get_chunk_layout.restype = ctypes.c_size_t
+        cdll.tms_resume_chunks.argtypes = [
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_size_t,
+        ]
+        cdll.tms_resume_chunks.restype = ctypes.c_int
+        cdll.tms_map_chunks.argtypes = [
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_size_t,
+        ]
+        cdll.tms_map_chunks.restype = ctypes.c_int
 
     # XPU-only symbols.
     if hasattr(cdll, "tms_xpu_prewarm_devices"):

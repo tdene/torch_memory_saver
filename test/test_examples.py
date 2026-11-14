@@ -26,6 +26,15 @@ from examples import (
     nested_region,
     pause_inflight,
     xpu_scenarios,
+    free_outside_region,
+    resume_oom,
+    allocation_granularity,
+    malloc_oom,
+    release_region_pools,
+    tag_scope_shared_pool,
+    initially_released,
+    chunked,
+    map_chunks,
 )
 
 # XPU only supports hook_mode='torch'; MUSA supports both hook modes.
@@ -43,6 +52,10 @@ _skip_on_lupine = pytest.mark.skipif(
 )
 _xpu_only = pytest.mark.skipif(not _IS_XPU, reason="XPU-specific path")
 _rocm_only = pytest.mark.skipif(torch.version.hip is None, reason="ROCm-specific path")
+_cuda_only = pytest.mark.skipif(
+    _IS_XPU or _IS_MUSA or torch.version.hip is not None,
+    reason="CUDA-specific path",
+)
 _device_module = get_device_module()
 _multi_device_only = pytest.mark.skipif(
     _device_module.device_count() < 2,
@@ -197,6 +210,138 @@ def test_cuda_vmm_granularity():
 def test_rocm_vmm_adjacent_host_register():
     with change_env("TMS_INIT_ENABLE", "1"):
         _test_core(rocm_vmm_adjacent_host_register.run, hook_mode="preload")
+
+
+@_cuda_only
+@pytest.mark.skipif(
+    not _device_module.is_available(),
+    reason="Free outside a region requires a GPU",
+)
+def test_free_outside_region():
+    # The hook used to end the process at such a free: the child's exit status is the result.
+    subprocess.run(
+        [sys.executable, free_outside_region.__file__, "torch"],
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+        check=True,
+        timeout=120,
+    )
+
+
+@_cuda_only
+@pytest.mark.skipif(
+    not _device_module.is_available(),
+    reason="Resume without device memory requires a GPU",
+)
+@pytest.mark.parametrize("hook_mode", _HOOK_MODES)
+def test_resume_oom(hook_mode):
+    ctx = torch_memory_saver.configure_subprocess() if hook_mode == "preload" else nullcontext()
+    with ctx:
+        # The hook used to end the process at such a resume: the child's exit status is the result.
+        subprocess.run(
+            [sys.executable, resume_oom.__file__, hook_mode],
+            env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+            check=True,
+            timeout=300,
+        )
+
+
+@_cuda_only
+@pytest.mark.skipif(
+    not _device_module.is_available(),
+    reason="The allocation granularity of a device requires a GPU",
+)
+@pytest.mark.parametrize("hook_mode", _HOOK_MODES)
+def test_allocation_granularity(hook_mode):
+    ctx = torch_memory_saver.configure_subprocess() if hook_mode == "preload" else nullcontext()
+    with ctx:
+        # The hook ends the process if the driver refuses the query: the child's exit status is the result.
+        subprocess.run(
+            [sys.executable, allocation_granularity.__file__, hook_mode],
+            env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+            check=True,
+            timeout=120,
+        )
+
+
+@_cuda_only
+@pytest.mark.skipif(
+    not _device_module.is_available(),
+    reason="A region allocation without device memory requires a GPU",
+)
+def test_malloc_oom():
+    # The hook used to end the process at such an allocation: the child's exit status is the result.
+    subprocess.run(
+        [sys.executable, malloc_oom.__file__, "torch"],
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+        check=True,
+        timeout=120,
+    )
+
+
+@_cuda_only
+@pytest.mark.skipif(
+    not _device_module.is_available(),
+    reason="Dropping a region's memory pools requires a GPU",
+)
+@pytest.mark.parametrize("hook_mode", _HOOK_MODES)
+def test_release_region_pools(hook_mode):
+    ctx = torch_memory_saver.configure_subprocess() if hook_mode == "preload" else nullcontext()
+    with ctx:
+        # PyTorch can end the process where a pool is destroyed: the child's exit status is the result.
+        subprocess.run(
+            [sys.executable, release_region_pools.__file__, hook_mode],
+            env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+            check=True,
+            timeout=300,
+        )
+
+
+@_cuda_only
+@pytest.mark.skipif(
+    not _device_module.is_available(),
+    reason="A memory pool that holds two tags requires a GPU",
+)
+@pytest.mark.parametrize("hook_mode", _HOOK_MODES)
+def test_tag_scope_shared_pool(hook_mode):
+    ctx = torch_memory_saver.configure_subprocess() if hook_mode == "preload" else nullcontext()
+    with ctx:
+        # The torch hook ends the process when it is asked for memory outside a scope: the child's exit status is the result.
+        subprocess.run(
+            [sys.executable, tag_scope_shared_pool.__file__, hook_mode],
+            env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+            check=True,
+            timeout=300,
+        )
+
+
+@_cuda_only
+@pytest.mark.skipif(
+    not _device_module.is_available(),
+    reason="A region without device memory requires a GPU",
+)
+@pytest.mark.parametrize("hook_mode", _HOOK_MODES)
+def test_initially_released(hook_mode):
+    _test_core(initially_released.run, hook_mode=hook_mode)
+
+
+@_cuda_only
+@pytest.mark.skipif(
+    not _device_module.is_available(),
+    reason="A chunked region requires a GPU",
+)
+@pytest.mark.parametrize("hook_mode", _HOOK_MODES)
+def test_chunked_region(hook_mode):
+    _test_core(chunked.run, hook_mode=hook_mode)
+
+
+@_cuda_only
+@pytest.mark.skipif(
+    not _device_module.is_available(),
+    reason="Device memory at two addresses requires a GPU",
+)
+@pytest.mark.parametrize("hook_mode", _HOOK_MODES)
+def test_map_chunks(hook_mode):
+    _test_core(map_chunks.run, hook_mode=hook_mode)
 
 
 @pytest.mark.skipif(

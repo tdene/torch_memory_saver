@@ -55,6 +55,11 @@ public:
         enable_disk_backup_ = value;
     }
 
+    // Set through CUDA-only entrypoints. initially_released_: the region's allocations
+    // reserve address space only. chunk_size_ > 0: each is backed by one handle per chunk.
+    bool initially_released_ = false;
+    size_t chunk_size_ = 0;
+
 private:
     std::optional<bool> is_interesting_region_;
     std::optional<bool> enable_cpu_backup_;
@@ -77,7 +82,8 @@ cudaError_t cudaMalloc(void **ptr, size_t size) {
         return TorchMemorySaver::instance().malloc(
             ptr, CUDAUtils::cu_ctx_get_device(), size, thread_local_config.current_tag_,
             thread_local_config.enable_cpu_backup(), thread_local_config.cpu_backup_kind(),
-            thread_local_config.enable_disk_backup());
+            thread_local_config.enable_disk_backup(), thread_local_config.initially_released_,
+            thread_local_config.chunk_size_);
     } else {
         return APIForwarder::call_real_cuda_malloc(ptr, size);
     }
@@ -98,10 +104,23 @@ void *tms_torch_malloc(ssize_t size, int device, cudaStream_t stream) {
 #endif
     SIMPLE_CHECK(thread_local_config.is_interesting_region(), "only support interesting region");
     void *ptr;
+#if defined(USE_CUDA)
+    const cudaError_t ret = TorchMemorySaver::instance().malloc(
+        &ptr, CUDAUtils::cu_device_get(device), size, thread_local_config.current_tag_,
+        thread_local_config.enable_cpu_backup(), thread_local_config.cpu_backup_kind(),
+        thread_local_config.enable_disk_backup(), thread_local_config.initially_released_,
+        thread_local_config.chunk_size_);
+    if (ret == cudaErrorMemoryAllocation) {
+        // PyTorch takes a null segment for out of memory and raises torch.OutOfMemoryError.
+        return nullptr;
+    }
+    CUDA_ERROR_CHECK(ret);
+#else
     CUDA_ERROR_CHECK(TorchMemorySaver::instance().malloc(
         &ptr, CUDAUtils::cu_device_get(device), size, thread_local_config.current_tag_,
         thread_local_config.enable_cpu_backup(), thread_local_config.cpu_backup_kind(),
         thread_local_config.enable_disk_backup()));
+#endif
     return ptr;
 }
 
@@ -111,7 +130,7 @@ void tms_torch_free(void *ptr, ssize_t ssize, int device, cudaStream_t stream) {
               << " ptr=" << ptr << " ssize=" << ssize << " device=" << device << " stream=" << stream
               << std::endl;
 #endif
-#if !defined(USE_XPU)
+#if !defined(USE_XPU) && !defined(USE_CUDA)
     SIMPLE_CHECK(thread_local_config.is_interesting_region(), "only support interesting region");
 #endif
     CUDA_ERROR_CHECK(TorchMemorySaver::instance().free(ptr));
@@ -205,6 +224,46 @@ uint32_t tms_affected_devices(const char* tag, int* out_device_ids, uint32_t cap
 uint8_t* tms_get_cpu_backup_pointer(const uint8_t* gpu_ptr, uint64_t size) {
     return TorchMemorySaver::instance().get_cpu_backup_pointer(gpu_ptr, size);
 }
+
+#if defined(USE_CUDA)
+size_t tms_get_allocation_granularity(int device) {
+    return CUDAUtils::cu_mem_get_allocation_size(1, CUDAUtils::cu_device_get(device));
+}
+
+void tms_set_initially_released(bool initially_released) {
+    thread_local_config.initially_released_ = initially_released;
+}
+
+bool tms_get_initially_released() {
+    return thread_local_config.initially_released_;
+}
+
+void tms_set_chunk_size(size_t chunk_size) {
+    thread_local_config.chunk_size_ = chunk_size;
+}
+
+size_t tms_get_chunk_size() {
+    return thread_local_config.chunk_size_;
+}
+
+size_t tms_get_chunk_layout(
+    const char* tag, uint64_t* out_addresses, size_t* out_sizes, uint8_t* out_states,
+    size_t capacity) {
+    return TorchMemorySaver::instance().get_chunk_layout(
+        tag, out_addresses, out_sizes, out_states, capacity);
+}
+
+int tms_resume_chunks(const char* tag, const size_t* indices, size_t count) {
+    return TorchMemorySaver::instance().resume_chunks(tag, indices, count);
+}
+
+int tms_map_chunks(
+    const char* dst_tag, const size_t* dst_indices,
+    const char* src_tag, const size_t* src_indices, size_t count) {
+    return TorchMemorySaver::instance().map_chunks(
+        dst_tag, dst_indices, src_tag, src_indices, count);
+}
+#endif
 
 #if defined(USE_XPU)
 void tms_xpu_prewarm_devices(int n_devices) {
