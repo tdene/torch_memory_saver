@@ -107,12 +107,13 @@ def one_pass(label, chunk):
 
 
 def main():
-    torch_memory_saver.hook_mode = sys.argv[1] if len(sys.argv) > 1 else "torch"
+    hook_mode = sys.argv[1] if len(sys.argv) > 1 else "torch"
+    torch_memory_saver.hook_mode = hook_mode
     granularity = torch_memory_saver.get_allocation_granularity()
     chunk = 32 * granularity
     print(
         f"{torch.cuda.get_device_name(0)}, torch {torch.__version__}, hook mode "
-        f"{torch_memory_saver.hook_mode}, granularity {granularity} bytes",
+        f"{hook_mode}, granularity {granularity} bytes",
         flush=True,
     )
     cold = one_pass("cold", chunk)
