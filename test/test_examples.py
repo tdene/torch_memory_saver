@@ -31,6 +31,7 @@ from examples import (
     allocation_granularity,
     malloc_oom,
     release_region_pools,
+    tag_scope_shared_pool,
 )
 
 # XPU only supports hook_mode='torch'; MUSA supports both hook modes.
@@ -286,6 +287,24 @@ def test_release_region_pools(hook_mode):
         # PyTorch can end the process where a pool is destroyed: the child's exit status is the result.
         subprocess.run(
             [sys.executable, release_region_pools.__file__, hook_mode],
+            env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+            check=True,
+            timeout=300,
+        )
+
+
+@_cuda_only
+@pytest.mark.skipif(
+    not _device_module.is_available(),
+    reason="A memory pool that holds two tags requires a GPU",
+)
+@pytest.mark.parametrize("hook_mode", _HOOK_MODES)
+def test_tag_scope_shared_pool(hook_mode):
+    ctx = torch_memory_saver.configure_subprocess() if hook_mode == "preload" else nullcontext()
+    with ctx:
+        # The torch hook ends the process when it is asked for memory outside a scope: the child's exit status is the result.
+        subprocess.run(
+            [sys.executable, tag_scope_shared_pool.__file__, hook_mode],
             env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
             check=True,
             timeout=300,

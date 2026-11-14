@@ -46,6 +46,12 @@ torch_memory_saver.pause("type1")
 torch_memory_saver.resume("type1")
 ```
 
+`region` gives every tag memory pools of its own. To keep memory of several tags
+in one pool, create the pool with `torch_memory_saver.create_mem_pool()` and
+allocate into it, for example under `torch.cuda.use_mem_pool(pool)`, inside
+`torch_memory_saver.tag_scope(tag=...)`, which sets the tag and the backup
+options like `region` but enters no pool.
+
 ### Release Memory in CUDA Graph
 
 Not only does torch_memory_saver make tensors compatible with CUDA graph, but we can also release the memory held by CUDA graph (i.e. the intermediate tensors).

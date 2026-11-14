@@ -142,6 +142,52 @@ class TorchMemorySaver:
         self._ensure_initialized()
         return self._impl.release_region_pools(tag)
 
+    @contextmanager
+    def tag_scope(
+        self,
+        tag: str = _TAG_DEFAULT,
+        enable_cpu_backup: bool = False,
+        enable_disk_backup: bool = False,
+        cpu_backup_backend: Optional[CpuBackupBackend] = None,
+    ):
+        """region() without its memory pool: only the tag and the backup settings
+        of the calling thread, with the meaning they have for region().
+
+        Memory that reaches torch_memory_saver while the scope is open gets them,
+        whichever pool it is allocated into. Entering a pool is left to the
+        caller: with a pool from create_mem_pool(), one pool can hold memory of
+        several tags, each paused and resumed by its tag. Without a pool,
+        hook_mode="preload" tags segments of PyTorch's default pool, which later
+        tensors reuse.
+        """
+        self._validate_cpu_backup_backend(enable_cpu_backup, cpu_backup_backend)
+        self._ensure_initialized()
+        assert not (enable_cpu_backup and enable_disk_backup), \
+            "enable_cpu_backup and enable_disk_backup are mutually exclusive"
+        with self._impl._with_region_config(
+            tag=tag,
+            enable_cpu_backup=enable_cpu_backup,
+            enable_disk_backup=enable_disk_backup,
+            cpu_backup_backend=cpu_backup_backend,
+        ):
+            yield
+
+    def create_mem_pool(self) -> "torch.cuda.MemPool":
+        """A new memory pool on torch_memory_saver's allocator, on the current
+        device. It belongs to the caller: torch_memory_saver keeps no reference.
+
+        Allocate into it only inside tag_scope() or region(): outside of both, a
+        request for a new segment ends the process in hook_mode="torch" and gets
+        memory that cannot be paused in hook_mode="preload". Delete what uses the
+        pool before the pool: up to PyTorch 2.9 destroying a pool that a CUDA
+        graph still uses aborts, and up to 2.7 a segment that outlives its pool
+        is returned with cudaFree, not through the pool's allocator. On ROCm and
+        MUSA, hook_mode="torch" ends the process at a free outside of both as
+        well: drop the pool inside one.
+        """
+        self._ensure_initialized()
+        return self._impl.create_mem_pool()
+
     # for compatibility
     @property
     def enabled(self):
@@ -304,6 +350,9 @@ class _TorchMemorySaverImpl:
                 cpu_backup_backend=cpu_backup_backend,
             ):
                 yield
+
+    def create_mem_pool(self):
+        return self._device_module.MemPool(allocator=self._hook_util.get_allocator())
 
     def _current_device(self) -> int:
         return self._device_module.current_device()
