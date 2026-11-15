@@ -150,6 +150,15 @@ def run(hook_mode: str):
     fill(cache, values(70))
     pause_and_resume(cache, values(70, (2, 6)))
     assert_backup(cache, values(70, (2, 6)))
+    # Two other chunks are as many bytes: the next pause keeps the slot where it is and
+    # writes chunks 0 and 5 where chunks 2 and 6 were.
+    slot = torch_memory_saver.get_cpu_backup(part(cache, 2), zero_copy=True).data_ptr()
+    torch_memory_saver.set_chunk_backup(_TAG, [2, 6], False)
+    torch_memory_saver.set_chunk_backup(_TAG, [0, 5], True)
+    fill(cache, values(110))
+    pause_and_resume(cache, values(110, (0, 5)))
+    assert_backup(cache, values(110, (0, 5)))
+    assert torch_memory_saver.get_cpu_backup(part(cache, 0), zero_copy=True).data_ptr() == slot
     torch_memory_saver.set_chunk_backup(_TAG, range(_CHUNKS), False)
     pause_and_resume(cache, {})
     assert_backup(cache, {})
@@ -328,7 +337,8 @@ def run_host_bytes(hook_mode: str):
     assert abs(host_bytes_of_pause()) < slack
 
     # A retained slot outlives the resume. The next pause makes it the size of its own
-    # selection, smaller as well as larger, and frees it when no chunk is enabled.
+    # selection, smaller as well as larger, keeps it for other chunks of the same size, and
+    # frees it when no chunk is enabled.
     torch_memory_saver.retain_cpu_backup = True
     mod.synchronize()
     without_slot = _anonymous_bytes()
@@ -345,6 +355,7 @@ def run_host_bytes(hook_mode: str):
 
     assert abs(retained_bytes([2, 5, 6], 1) - 3 * chunk) < slack
     assert abs(retained_bytes([2, 6], 2) - 2 * chunk) < slack
+    assert abs(retained_bytes([0, 5], 5) - 2 * chunk) < slack
     assert abs(retained_bytes([0, 1, 2, 6], 3) - 4 * chunk) < slack
     assert abs(retained_bytes([], 4)) < slack
 
