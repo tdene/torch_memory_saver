@@ -759,9 +759,11 @@ class _TorchMemorySaverImpl:
         )
 
     def set_chunk_backup(self, tag: str, chunk_indices: Sequence[int], enabled: bool) -> None:
+        # Before the indices are checked: without CUDA the call is refused whatever they are.
+        cdll = self._chunk_cdll()
         call = f"set_chunk_backup(tag={tag!r})"
         indices = _chunk_index_array(chunk_indices, call)
-        status = self._chunk_cdll().tms_set_chunk_backup(
+        status = cdll.tms_set_chunk_backup(
             tag.encode("utf-8"), indices, len(indices), enabled
         )
         _raise_for_chunk_status(status, call)
