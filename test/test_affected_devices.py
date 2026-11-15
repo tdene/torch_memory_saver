@@ -128,6 +128,27 @@ def test_set_chunk_backup_status(status, error, enabled):
     assert seen == [(b"kv", [3, 1], enabled)]
 
 
+@pytest.mark.parametrize("index", [2**64, 2**64 + 3, -1, -(2**64)])
+def test_set_chunk_backup_index_beyond_size_t(index):
+    seen = []
+
+    def set_chunk_backup(tag, indices, count, enabled):
+        seen.append(list(indices[:count]))
+        return 0
+
+    impl = _chunk_impl(tms_set_chunk_backup=set_chunk_backup)
+    # As a size_t the index would be that of another chunk, 2**64 that of chunk 0: it never
+    # reaches the hook.
+    with pytest.raises(IndexError, match="nothing was changed") as caught:
+        _TorchMemorySaverImpl.set_chunk_backup(impl, "kv", [1, index], False)
+    assert caught.type is IndexError
+    assert seen == []
+
+    # The largest size_t is the hook's to refuse.
+    _TorchMemorySaverImpl.set_chunk_backup(impl, "kv", [0, 2**64 - 1], False)
+    assert seen == [[0, 2**64 - 1]]
+
+
 @pytest.mark.parametrize("call", ["pause", "resume"])
 @pytest.mark.parametrize("status, error", [(0, None), (1, RuntimeError), (2, torch.OutOfMemoryError)])
 def test_pause_resume_status(call, status, error):

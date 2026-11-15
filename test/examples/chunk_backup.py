@@ -214,6 +214,7 @@ def run(hook_mode: str):
         unbacked = torch.empty((chunk,), dtype=torch.uint8, device=device)
     for error, tag, indices, enabled in (
         (IndexError, _TAG, [0, _CHUNKS], False),
+        (IndexError, _TAG, [2**64], False),  # as a size_t it would be chunk 0
         (IndexError, "chunk_backup_no_such_tag", [0], False),
         (ValueError, _TAG_UNBACKED, [0], False),  # the region has no CPU backup
         (ValueError, _TAG_UNBACKED, [0], True),

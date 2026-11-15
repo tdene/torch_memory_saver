@@ -35,6 +35,8 @@ _CHUNK_ERRORS = {
     -5: (ValueError, "a destination chunk and its source chunk differ in size or device"),
     -6: (ValueError, "the region of a chunk has no CPU backup"),
 }
+_CHUNK_INDEX_OUT_OF_RANGE = -1
+_SIZE_MAX = ctypes.c_size_t(-1).value
 # kMappedChunkOrder in csrc/core.h: pause() or resume() against the order that map_chunks() needs.
 _MAPPED_CHUNK_ORDER = 1
 
@@ -43,6 +45,15 @@ def _raise_for_chunk_status(status: int, call: str) -> None:
     if status != 0:
         error, reason = _CHUNK_ERRORS[status]
         raise error(f"torch_memory_saver.{call}: {reason}; nothing was changed")
+
+
+def _chunk_index_array(chunk_indices: Sequence[int], call: str):
+    """The indices as the size_t array of a chunk call. ctypes stores an index that size_t
+    cannot hold as the index of another chunk, 2**64 as 0: such an index is out of range."""
+    indices = [operator.index(index) for index in chunk_indices]
+    if not all(0 <= index <= _SIZE_MAX for index in indices):
+        _raise_for_chunk_status(_CHUNK_INDEX_OUT_OF_RANGE, call)
+    return (ctypes.c_size_t * len(indices))(*indices)
 
 
 def _is_cuda_build() -> bool:
@@ -748,11 +759,12 @@ class _TorchMemorySaverImpl:
         )
 
     def set_chunk_backup(self, tag: str, chunk_indices: Sequence[int], enabled: bool) -> None:
-        indices = (ctypes.c_size_t * len(chunk_indices))(*chunk_indices)
+        call = f"set_chunk_backup(tag={tag!r})"
+        indices = _chunk_index_array(chunk_indices, call)
         status = self._chunk_cdll().tms_set_chunk_backup(
             tag.encode("utf-8"), indices, len(indices), enabled
         )
-        _raise_for_chunk_status(status, f"set_chunk_backup(tag={tag!r})")
+        _raise_for_chunk_status(status, call)
 
     def release_region_pools(self, tag: Optional[str]) -> int:
         # A pool is named inside the comprehension only: the traceback of the error below keeps
