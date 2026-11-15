@@ -106,6 +106,28 @@ def test_map_chunks_status(status, error):
     assert len(seen) == 1
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize(
+    "status, error",
+    [(0, None), (-1, IndexError), (-2, RuntimeError), (-6, ValueError)],
+)
+def test_set_chunk_backup_status(status, error, enabled):
+    seen = []
+
+    def set_chunk_backup(tag, indices, count, enabled):
+        seen.append((tag, list(indices[:count]), enabled))
+        return status
+
+    impl = _chunk_impl(tms_set_chunk_backup=set_chunk_backup)
+    if error is None:
+        _TorchMemorySaverImpl.set_chunk_backup(impl, "kv", [3, 1], enabled)
+    else:
+        with pytest.raises(error, match="nothing was changed") as caught:
+            _TorchMemorySaverImpl.set_chunk_backup(impl, "kv", [3, 1], enabled)
+        assert caught.type is error
+    assert seen == [(b"kv", [3, 1], enabled)]
+
+
 @pytest.mark.parametrize("call", ["pause", "resume"])
 @pytest.mark.parametrize("status, error", [(0, None), (1, RuntimeError), (2, torch.OutOfMemoryError)])
 def test_pause_resume_status(call, status, error):

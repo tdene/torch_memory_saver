@@ -33,6 +33,7 @@ _CHUNK_ERRORS = {
     -3: (ValueError, "a destination chunk holds memory already or is listed twice"),
     -4: (ValueError, "a source chunk holds no memory of its own"),
     -5: (ValueError, "a destination chunk and its source chunk differ in size or device"),
+    -6: (ValueError, "the region of a chunk has no CPU backup"),
 }
 # kMappedChunkOrder in csrc/core.h: pause() or resume() against the order that map_chunks() needs.
 _MAPPED_CHUNK_ORDER = 1
@@ -85,8 +86,8 @@ class TorchMemorySaver:
         get_allocation_granularity() and applies to every allocation made in the
         region, PyTorch's pool segments included. pause(tag) and resume(tag) treat
         such an allocation as a whole and pass chunks without memory by;
-        get_chunk_layout(), get_chunk_states(), resume_chunks() and map_chunks()
-        address its chunks by tag. No disk backup.
+        get_chunk_layout(), get_chunk_states(), resume_chunks(), map_chunks() and
+        set_chunk_backup() address its chunks by tag. No disk backup.
 
         initially_released (CUDA only): the region's allocations reserve address
         space only. Each is born paused, with no device memory and no backup, and
@@ -204,14 +205,37 @@ class TorchMemorySaver:
         torch.OutOfMemoryError with nothing changed.
 
         pause(dst_tag) unmaps the chunks, after backing their contents up through
-        its own addresses when its region has CPU backup; resume(dst_tag) maps
-        them again from the memory src_tag holds then and restores that backup.
-        Pause dst_tag before src_tag and resume it after: pause(src_tag) raises
-        RuntimeError while dst_tag maps its chunks, resume(dst_tag) while src_tag
-        is paused. Freeing either allocation removes the mapping. CUDA only.
+        its own addresses when its region has CPU backup (set_chunk_backup() can
+        turn that off); resume(dst_tag) maps them again from the memory src_tag
+        holds then and restores that backup. Pause dst_tag before src_tag and
+        resume it after: pause(src_tag) raises RuntimeError while dst_tag maps
+        its chunks, resume(dst_tag) while src_tag is paused. Freeing either
+        allocation removes the mapping. CUDA only.
         """
         self._ensure_initialized()
         self._impl.map_chunks(dst_tag, dst_chunk_indices, src_tag, src_chunk_indices)
+
+    def set_chunk_backup(self, tag: str, chunk_indices: Sequence[int], enabled: bool) -> None:
+        """Choose whether pause() backs up the contents of the listed chunks of the tag.
+
+        Every chunk starts enabled: pause(tag) copies each chunk that holds device
+        memory to the host. A chunk that is not enabled is left out of that copy
+        and of its host memory. pause(tag) still releases its device memory, or
+        unmaps it if map_chunks() mapped it, and resume(tag) gives it memory at
+        the same address again: its own, with undefined contents, or the chunk of
+        its source, with what that holds. The choice stays until it is changed.
+
+        The two chunks of a map_chunks() pair are one piece of memory and need
+        one backup. With the destination's, resume(dst_tag) restores it into the
+        memory that the source holds by then; with the source's, the destination
+        maps the restored memory.
+
+        All or nothing, with no chunk changed: IndexError for an index outside
+        the tag's chunks, ValueError for a chunk whose region has no CPU backup,
+        RuntimeError while the tag is paused. CUDA only.
+        """
+        self._ensure_initialized()
+        self._impl.set_chunk_backup(tag, chunk_indices, enabled)
 
     def release_region_pools(self, tag: Optional[str] = None) -> int:
         """Drop the memory pools of the regions of one tag (None: of every tag) and
@@ -722,6 +746,13 @@ class _TorchMemorySaverImpl:
         _raise_for_chunk_status(
             status, f"map_chunks(dst_tag={dst_tag!r}, src_tag={src_tag!r})"
         )
+
+    def set_chunk_backup(self, tag: str, chunk_indices: Sequence[int], enabled: bool) -> None:
+        indices = (ctypes.c_size_t * len(chunk_indices))(*chunk_indices)
+        status = self._chunk_cdll().tms_set_chunk_backup(
+            tag.encode("utf-8"), indices, len(indices), enabled
+        )
+        _raise_for_chunk_status(status, f"set_chunk_backup(tag={tag!r})")
 
     def release_region_pools(self, tag: Optional[str]) -> int:
         # A pool is named inside the comprehension only: the traceback of the error below keeps
