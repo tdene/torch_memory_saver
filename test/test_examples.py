@@ -35,6 +35,7 @@ from examples import (
     initially_released,
     chunked,
     map_chunks,
+    chunk_backup,
 )
 
 # XPU only supports hook_mode='torch'; MUSA supports both hook modes.
@@ -342,6 +343,25 @@ def test_chunked_region(hook_mode):
 @pytest.mark.parametrize("hook_mode", _HOOK_MODES)
 def test_map_chunks(hook_mode):
     _test_core(map_chunks.run, hook_mode=hook_mode)
+
+
+@_cuda_only
+@pytest.mark.skipif(
+    not _device_module.is_available(),
+    reason="Choosing the chunks that a pause backs up requires a GPU",
+)
+@pytest.mark.parametrize("hook_mode", _HOOK_MODES)
+def test_chunk_backup(hook_mode):
+    _test_core(chunk_backup.run, hook_mode=hook_mode)
+
+
+@_cuda_only
+@pytest.mark.skipif(
+    not _device_module.is_available() or sys.platform != "linux",
+    reason="The host memory of a chunk backup needs Linux /proc and a GPU",
+)
+def test_chunk_backup_host_bytes():
+    _test_core(chunk_backup.run_host_bytes, hook_mode="torch")
 
 
 @pytest.mark.skipif(
