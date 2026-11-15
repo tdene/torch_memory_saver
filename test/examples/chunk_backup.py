@@ -163,6 +163,21 @@ def run(hook_mode: str):
     pause_and_resume(cache, values(110, (0, 5)))
     assert_backup(cache, values(110, (0, 5)))
     assert torch_memory_saver.get_cpu_backup(part(cache, 0), zero_copy=True).data_ptr() == slot
+    # A chunk of the selection before is written again like any other, where it lay or at
+    # a new place: chunk 5 keeps the second place, and then chunk 2 moves from the first
+    # place to the second.
+    torch_memory_saver.set_chunk_backup(_TAG, [0], False)
+    torch_memory_saver.set_chunk_backup(_TAG, [2], True)
+    fill(cache, values(130))
+    pause_and_resume(cache, values(130, (2, 5)))
+    assert_backup(cache, values(130, (2, 5)))
+    assert torch_memory_saver.get_cpu_backup(part(cache, 2), zero_copy=True).data_ptr() == slot
+    torch_memory_saver.set_chunk_backup(_TAG, [5], False)
+    torch_memory_saver.set_chunk_backup(_TAG, [0], True)
+    fill(cache, values(140))
+    pause_and_resume(cache, values(140, (0, 2)))
+    assert_backup(cache, values(140, (0, 2)))
+    assert torch_memory_saver.get_cpu_backup(part(cache, 0), zero_copy=True).data_ptr() == slot
     torch_memory_saver.set_chunk_backup(_TAG, range(_CHUNKS), False)
     pause_and_resume(cache, {})
     assert_backup(cache, {})
@@ -253,6 +268,27 @@ def run(hook_mode: str):
     torch_memory_saver.resume(_TAG_DST)
     assert states(_TAG_DST) == [True, True, True, True, False, False]
     assert kept(dst, {0: 1, 1: 2, 2: 22})
+    # The same for a destination that is active when its source is freed. Chunks 4 and 5,
+    # of which chunk 4 is turned on again, map a new source and are unmapped with it.
+    with torch_memory_saver.region(tag=_TAG_SRC, enable_cpu_backup=True, chunk_size=chunk):
+        src = torch.empty((2 * chunk,), dtype=torch.uint8, device=device)
+    torch_memory_saver.set_chunk_backup(_TAG_DST, [4], True)
+    torch_memory_saver.map_chunks(_TAG_DST, [4, 5], _TAG_SRC, [0, 1])
+    assert states(_TAG_DST) == [True] * 6
+    del src
+    for key in [key for key in impl._mem_pools if key[0] == _TAG_SRC]:
+        del impl._mem_pools[key]
+    gc.collect()
+    empty_cache()
+    assert torch_memory_saver.get_chunk_layout(_TAG_SRC) == []
+    assert states(_TAG_DST) == [True, True, True, True, False, False]
+    torch_memory_saver.resume_chunks(_TAG_DST, [4, 5])
+    fill(dst, {4: 44, 5: 55})
+    torch_memory_saver.pause(_TAG_DST)
+    assert_backup(dst, {0: 1, 1: 2, 2: 22, 4: 44})
+    torch_memory_saver.resume(_TAG_DST)
+    assert states(_TAG_DST) == [True] * 6
+    assert kept(dst, {0: 1, 1: 2, 2: 22, 4: 44})
 
     # Part 6: refused calls, with either value. The first chunk of a refused list is not
     # changed either: chunk 0 stays on, and chunk 1, which is turned off here, stays off.
@@ -421,25 +457,30 @@ def run_host_bytes(hook_mode: str):
     assert abs(host_bytes_of_pause()) < slack
 
     # A retained slot outlives the resume. The next pause makes it the size of its own
-    # selection, smaller as well as larger, keeps it for other chunks of the same size, and
-    # frees it when no chunk is enabled.
+    # selection, smaller as well as larger, keeps it for another selection of the same size,
+    # with or without a chunk of the one before, and frees it when no chunk is enabled.
     torch_memory_saver.retain_cpu_backup = True
     mod.synchronize()
     without_slot = _anonymous_bytes()
 
     def retained_bytes(enabled, value):
-        tensor.fill_(value)
+        # A value of its own for each chunk: one that is restored from another chunk's place
+        # in the slot does not hold it.
+        for i in range(_CHUNKS):
+            tensor[i * chunk : (i + 1) * chunk].fill_(10 * value + i)
         torch_memory_saver.set_chunk_backup(_TAG, range(_CHUNKS), False)
         torch_memory_saver.set_chunk_backup(_TAG, enabled, True)
         torch_memory_saver.pause(_TAG)
         torch_memory_saver.resume(_TAG)
         mod.synchronize()
-        assert all(_holds(tensor[i * chunk : (i + 1) * chunk], value) for i in enabled)
+        assert all(_holds(tensor[i * chunk : (i + 1) * chunk], 10 * value + i) for i in enabled)
         return _anonymous_bytes() - without_slot
 
     assert abs(retained_bytes([2, 5, 6], 1) - 3 * chunk) < slack
     assert abs(retained_bytes([2, 6], 2) - 2 * chunk) < slack
     assert abs(retained_bytes([0, 5], 5) - 2 * chunk) < slack
+    assert abs(retained_bytes([2, 5], 6) - 2 * chunk) < slack
+    assert abs(retained_bytes([0, 2], 7) - 2 * chunk) < slack
     assert abs(retained_bytes([0, 1, 2, 6], 3) - 4 * chunk) < slack
     assert abs(retained_bytes([], 4)) < slack
 

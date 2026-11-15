@@ -149,6 +149,26 @@ def test_set_chunk_backup_index_beyond_size_t(index):
     assert seen == [[0, 2**64 - 1]]
 
 
+@pytest.mark.parametrize("index", [0, -1, 2**64])
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda impl, index: _TorchMemorySaverImpl.resume_chunks(impl, "kv", [index]),
+        lambda impl, index: _TorchMemorySaverImpl.map_chunks(impl, "kv", [index], "mamba", [index]),
+        lambda impl, index: _TorchMemorySaverImpl.set_chunk_backup(impl, "kv", [index], False),
+    ],
+    ids=["resume_chunks", "map_chunks", "set_chunk_backup"],
+)
+def test_chunk_calls_need_cuda_for_any_index(monkeypatch, call, index):
+    monkeypatch.setattr("torch_memory_saver.entrypoint._is_cuda_build", lambda: False)
+    # A binary without the chunk functions: a call that got as far as one would not find it.
+    impl = SimpleNamespace(_binary_wrapper=SimpleNamespace(cdll=SimpleNamespace()))
+    impl._chunk_cdll = lambda: _TorchMemorySaverImpl._chunk_cdll(impl)
+    with pytest.raises(NotImplementedError, match="only supported on CUDA") as caught:
+        call(impl, index)
+    assert caught.type is NotImplementedError
+
+
 @pytest.mark.parametrize("call", ["pause", "resume"])
 @pytest.mark.parametrize("status, error", [(0, None), (1, RuntimeError), (2, torch.OutOfMemoryError)])
 def test_pause_resume_status(call, status, error):
