@@ -6,9 +6,10 @@ one host slot. Part 2 turns chunks off: the pause still returns the device memor
 chunk, copies the enabled ones only, and the resume restores exactly those. Part 3 changes
 the selection between pauses, down to none and back to all. Part 4 does so with retained
 backups. Part 5 keeps one backup of a map_chunks() pair, on the destination and then on
-the source. Part 6: a refused call changes nothing. Part 7 is a tag with two allocations:
-its chunks are numbered across them, and a chunk keeps its choice when it gets memory and
-when the allocation before it is freed. run_host_bytes() reads the size of the host slot,
+the source; a destination chunk keeps its choice when it is mapped and when its source is
+freed. Part 6: a refused call changes nothing. Part 7 is a tag with two allocations: its
+chunks are numbered across them, and a chunk keeps its choice when it gets memory and when
+the allocation before it is freed. run_host_bytes() reads the size of the host slot,
 retained or not, from the memory of the process.
 """
 
@@ -221,6 +222,35 @@ def run(hook_mode: str):
     mod.synchronize()
     assert _holds(part(dst, 4), 5)
 
+    # A chunk keeps its choice when map_chunks() gives it memory. Destination chunk 3 is
+    # turned off and then maps source chunk 1; chunk 2, which maps source chunk 0, is on.
+    torch_memory_saver.set_chunk_backup(_TAG_DST, [3], False)
+    torch_memory_saver.map_chunks(_TAG_DST, [2, 3], _TAG_SRC, [0, 1])
+    assert states(_TAG_DST) == [True] * 6
+    torch_memory_saver.pause(_TAG_DST)
+    assert_backup(dst, {0: 1, 1: 2, 2: 10})
+    # It keeps it when it loses its source too. The source is freed while the destination
+    # is paused, which takes chunk 2 out of that backup.
+    impl = torch_memory_saver._impl
+    del src
+    for key in [key for key in impl._mem_pools if key[0] == _TAG_SRC]:
+        del impl._mem_pools[key]
+    gc.collect()
+    empty_cache()
+    assert torch_memory_saver.get_chunk_layout(_TAG_SRC) == []
+    assert_backup(dst, {0: 1, 1: 2})
+    torch_memory_saver.resume(_TAG_DST)
+    assert states(_TAG_DST) == [True, True, False, False, False, False]
+    assert kept(dst, {0: 1, 1: 2})
+    # With memory of their own, chunk 2 is still on and chunk 3 still off.
+    torch_memory_saver.resume_chunks(_TAG_DST, [2, 3])
+    fill(dst, {2: 22, 3: 33})
+    torch_memory_saver.pause(_TAG_DST)
+    assert_backup(dst, {0: 1, 1: 2, 2: 22})
+    torch_memory_saver.resume(_TAG_DST)
+    assert states(_TAG_DST) == [True, True, True, True, False, False]
+    assert kept(dst, {0: 1, 1: 2, 2: 22})
+
     # Part 6: refused calls. The first chunk of a refused list is not changed either.
     with torch_memory_saver.region(tag=_TAG_UNBACKED, chunk_size=chunk):
         unbacked = torch.empty((chunk,), dtype=torch.uint8, device=device)
@@ -240,7 +270,6 @@ def run(hook_mode: str):
 
     # Part 7: a tag with two allocations, like the segments of one pool. Chunks 0 and 1 are
     # the first's, chunks 2 to 5 the second's.
-    impl = torch_memory_saver._impl
     with torch_memory_saver.region(tag=_TAG_SEGMENTS, enable_cpu_backup=True, chunk_size=chunk):
         first = torch.empty((2 * chunk,), dtype=torch.uint8, device=device)
     [first_pool] = [key for key in impl._mem_pools if key[0] == _TAG_SEGMENTS]
@@ -294,7 +323,7 @@ def run(hook_mode: str):
     assert _holds(normal_tensor, 100)
 
     # Return the regions' memory before the interpreter exits: the tensors, then their pools.
-    del cache, src, dst, unbacked, second
+    del cache, dst, unbacked, second
     torch_memory_saver._impl._mem_pools.clear()
     gc.collect()
     empty_cache()
