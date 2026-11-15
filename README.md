@@ -74,6 +74,12 @@ torch_memory_saver.get_chunk_states("cache")  # [True, True, False, False, True,
 A mapped chunk is the device memory of its source at a second address. Pause the
 tag that maps before the tag that owns the memory, and resume it after.
 
+With `enable_cpu_backup`, `pause` copies every chunk that holds memory to the
+host. `set_chunk_backup(tag, indices, False)` leaves chunks out of that copy,
+for example scratch memory, or one of the two chunks of a mapped pair, which
+needs one backup only. A chunk that is left out still gets memory at `resume`;
+its contents are then undefined unless the other chunk of its pair restores them.
+
 ### Release Memory in CUDA Graph
 
 Not only does torch_memory_saver make tensors compatible with CUDA graph, but we can also release the memory held by CUDA graph (i.e. the intermediate tensors).
