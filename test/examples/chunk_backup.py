@@ -9,8 +9,10 @@ backups. Part 5 keeps one backup of a map_chunks() pair, on the destination and 
 the source; a destination chunk keeps its choice when it is mapped and when its source is
 freed. Part 6: a refused call changes nothing. Part 7 is a tag with two allocations: its
 chunks are numbered across them, and a chunk keeps its choice when it gets memory and when
-the allocation before it is freed. run_host_bytes() reads the size of the host slot,
-retained or not, from the memory of the process.
+the allocation before it is freed. Part 8 is a tag with an allocation that has no CPU
+backup and one that is paused: a list is refused for a chunk of either and changes none of
+the chunks before it. run_host_bytes() reads the size of the host slot, retained or not,
+from the memory of the process.
 """
 
 import gc
@@ -26,6 +28,7 @@ _TAG_SRC = "chunk_backup_src"
 _TAG_DST = "chunk_backup_dst"
 _TAG_UNBACKED = "chunk_backup_unbacked"
 _TAG_SEGMENTS = "chunk_backup_segments"
+_TAG_MIXED = "chunk_backup_mixed"
 _CHUNKS = 8
 _HELD = (0, 1, 2, 5, 6)  # the chunks of _TAG that hold memory
 
@@ -251,11 +254,14 @@ def run(hook_mode: str):
     assert states(_TAG_DST) == [True, True, True, True, False, False]
     assert kept(dst, {0: 1, 1: 2, 2: 22})
 
-    # Part 6: refused calls. The first chunk of a refused list is not changed either.
+    # Part 6: refused calls, with either value. The first chunk of a refused list is not
+    # changed either: chunk 0 stays on, and chunk 1, which is turned off here, stays off.
     with torch_memory_saver.region(tag=_TAG_UNBACKED, chunk_size=chunk):
         unbacked = torch.empty((chunk,), dtype=torch.uint8, device=device)
+    torch_memory_saver.set_chunk_backup(_TAG, [1], False)
     for error, tag, indices, enabled in (
         (IndexError, _TAG, [0, _CHUNKS], False),
+        (IndexError, _TAG, [1, _CHUNKS], True),
         (IndexError, _TAG, [2**64], False),  # as a size_t it would be chunk 0
         (IndexError, "chunk_backup_no_such_tag", [0], False),
         (ValueError, _TAG_UNBACKED, [0], False),  # the region has no CPU backup
@@ -265,8 +271,9 @@ def run(hook_mode: str):
     fill(cache, values(80))
     torch_memory_saver.pause(_TAG)
     _assert_raises(RuntimeError, torch_memory_saver.set_chunk_backup, _TAG, [0], False)
+    _assert_raises(RuntimeError, torch_memory_saver.set_chunk_backup, _TAG, [1], True)
     torch_memory_saver.resume(_TAG)
-    pause_and_resume(cache, values(80))
+    pause_and_resume(cache, values(80, (0, 2, 5, 6)))
 
     # Part 7: a tag with two allocations, like the segments of one pool. Chunks 0 and 1 are
     # the first's, chunks 2 to 5 the second's.
@@ -320,10 +327,58 @@ def run(hook_mode: str):
     torch_memory_saver.resume(_TAG_SEGMENTS)
     assert states(_TAG_SEGMENTS) == [True, True, True, False]
     assert kept(second, {0: 95, 1: 98})
+
+    # Part 8: a list that is refused for a later chunk does not change the chunks before
+    # it. Chunks 0 and 1 of this tag have CPU backup, chunk 1 is off, and chunk 2 has none.
+    with torch_memory_saver.region(tag=_TAG_MIXED, enable_cpu_backup=True, chunk_size=chunk):
+        backed = torch.empty((2 * chunk,), dtype=torch.uint8, device=device)
+    with torch_memory_saver.region(tag=_TAG_MIXED, chunk_size=chunk):
+        plain = torch.empty((chunk,), dtype=torch.uint8, device=device)
+    early_pools = [key for key in impl._mem_pools if key[0] == _TAG_MIXED]
+    assert [address for address, _ in torch_memory_saver.get_chunk_layout(_TAG_MIXED)] == [
+        backed.data_ptr(),
+        backed.data_ptr() + chunk,
+        plain.data_ptr(),
+    ]
+    torch_memory_saver.set_chunk_backup(_TAG_MIXED, [1], False)
+    _assert_raises(ValueError, torch_memory_saver.set_chunk_backup, _TAG_MIXED, [0, 2], False)
+    _assert_raises(ValueError, torch_memory_saver.set_chunk_backup, _TAG_MIXED, [1, 2], True)
+    fill(backed, {0: 120, 1: 121})
+    torch_memory_saver.pause(_TAG_MIXED)
+    assert_backup(backed, {0: 120})
+    assert_backup(plain, {})
+
+    # An allocation that is made while the tag is paused is active: chunks 3 and 4, of
+    # which chunk 4 is off. A list that goes on to a paused chunk does not change them.
+    with torch_memory_saver.region(
+        tag=_TAG_MIXED, enable_cpu_backup=True, chunk_size=chunk, initially_released=True
+    ):
+        late = torch.empty((2 * chunk,), dtype=torch.uint8, device=device)
+    torch_memory_saver.resume_chunks(_TAG_MIXED, [3, 4])
+    assert states(_TAG_MIXED) == [False, False, False, True, True]
+    torch_memory_saver.set_chunk_backup(_TAG_MIXED, [4], False)
+    _assert_raises(RuntimeError, torch_memory_saver.set_chunk_backup, _TAG_MIXED, [3, 0], False)
+    _assert_raises(RuntimeError, torch_memory_saver.set_chunk_backup, _TAG_MIXED, [4, 0], True)
+    # A tag is paused as a whole: the paused allocations are freed, and the next pause
+    # shows the choice of the two chunks, which are chunks 0 and 1 by then.
+    del backed, plain
+    for key in early_pools:
+        del impl._mem_pools[key]
+    gc.collect()
+    empty_cache()
+    assert torch_memory_saver.get_chunk_layout(_TAG_MIXED) == [
+        (late.data_ptr() + i * chunk, chunk) for i in range(2)
+    ]
+    fill(late, {0: 122, 1: 123})
+    torch_memory_saver.pause(_TAG_MIXED)
+    assert_backup(late, {0: 122})
+    torch_memory_saver.resume(_TAG_MIXED)
+    assert states(_TAG_MIXED) == [True, True]
+    assert kept(late, {0: 122})
     assert _holds(normal_tensor, 100)
 
     # Return the regions' memory before the interpreter exits: the tensors, then their pools.
-    del cache, dst, unbacked, second
+    del cache, dst, unbacked, second, late
     torch_memory_saver._impl._mem_pools.clear()
     gc.collect()
     empty_cache()
