@@ -263,6 +263,10 @@ int tms_map_chunks(
     return TorchMemorySaver::instance().map_chunks(
         dst_tag, dst_indices, src_tag, src_indices, count);
 }
+
+int tms_set_chunk_backup(const char* tag, const size_t* indices, size_t count, bool enabled) {
+    return TorchMemorySaver::instance().set_chunk_backup(tag, indices, count, enabled);
+}
 #endif
 
 #if defined(USE_XPU)

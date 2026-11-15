@@ -39,6 +39,9 @@ struct Chunk {
     // source, whose memory it shares, whenever its own allocation is active.
     void* source = nullptr;
     size_t source_index = 0;
+    // Set by set_chunk_backup: whether pause() copies the chunk, if it holds memory then, into
+    // the allocation's cpu_backup slot. resume() restores the chunks that are in the slot.
+    bool backup = true;
     // Where the chunk's bytes start in the allocation's cpu_backup slot, if they are in it.
     size_t backup_offset = kNoChunkBackup;
 
@@ -55,6 +58,7 @@ enum TmsChunkStatus : int {
     TMS_CHUNK_DESTINATION_HOLDS_MEMORY = -3,
     TMS_CHUNK_SOURCE_WITHOUT_MEMORY = -4,
     TMS_CHUNK_PAIR_MISMATCH = -5,
+    TMS_CHUNK_WITHOUT_CPU_BACKUP = -6,
 };
 
 // What pause() and resume() return, with nothing changed, for a call against the order that
@@ -89,8 +93,8 @@ struct AllocationMetadata {
 #if defined(USE_CUDA)
     // An allocation of a region with chunk_size: chunk i covers
     // [i * chunk_size, min((i + 1) * chunk_size, allocation_size)), allocHandle is unused and
-    // cpu_backup packs the chunks that held memory at pause() in index order. chunk_size is 0
-    // and chunks is empty for every other allocation.
+    // cpu_backup packs the chunks that pause() backed up in index order. chunk_size is 0 and
+    // chunks is empty for every other allocation.
     size_t chunk_size = 0;
     std::vector<Chunk> chunks = {};
     // Order of allocation: numbers the chunks of a tag across its allocations.
@@ -130,6 +134,10 @@ public:
     int map_chunks(
         const std::string& dst_tag, const size_t* dst_indices,
         const std::string& src_tag, const size_t* src_indices, size_t count);
+    // Chooses, all or nothing, whether pause() backs the listed chunks up. Their allocations
+    // must have CPU backup and be active. Returns a TmsChunkStatus.
+    int set_chunk_backup(
+        const std::string& tag, const size_t* indices, size_t count, bool enabled);
 #endif
 
     cudaError_t pause(const std::string& tag);

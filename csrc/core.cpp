@@ -144,14 +144,15 @@ void copy_backed_up_chunks(void *ptr, const AllocationMetadata &metadata, bool t
     }
 }
 
-// Packs the chunks that hold memory into the cpu_backup slot in index order: an allocation
-// that is partly backed costs host memory for what it holds only.
+// Packs the chunks that hold memory and are to be backed up into the cpu_backup slot in index
+// order: an allocation costs host memory, and a copy, for those chunks only.
 void offload_chunks(void *ptr, AllocationMetadata &metadata) {
     size_t total = 0;
     for (size_t i = 0; i < metadata.chunks.size(); ++i) {
         Chunk &chunk = metadata.chunks[i];
-        chunk.backup_offset = chunk.holds_memory() ? total : kNoChunkBackup;
-        if (chunk.holds_memory()) {
+        const bool backed_up = chunk.backup && chunk.holds_memory();
+        chunk.backup_offset = backed_up ? total : kNoChunkBackup;
+        if (backed_up) {
             total += chunk_bytes(metadata, i);
         }
     }
@@ -888,6 +889,30 @@ int TorchMemorySaver::map_chunks(
         const ChunkRef &src = src_refs[src_indices[i]];
         dst.metadata->chunks[dst.index].source = src.base;
         dst.metadata->chunks[dst.index].source_index = src.index;
+    }
+    return TMS_CHUNK_OK;
+}
+
+int TorchMemorySaver::set_chunk_backup(
+    const std::string& tag, const size_t* indices, size_t count, const bool enabled) {
+    const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+    const std::vector<ChunkRef> refs = chunks_of_tag(tag);
+    for (size_t i = 0; i < count; ++i) {
+        if (indices[i] >= refs.size()) {
+            return TMS_CHUNK_INDEX_OUT_OF_RANGE;
+        }
+        const AllocationMetadata &metadata = *refs[indices[i]].metadata;
+        if (!metadata.enable_cpu_backup) {
+            return TMS_CHUNK_WITHOUT_CPU_BACKUP;
+        }
+        // A paused allocation has its backup already: the choice is for the next pause().
+        if (metadata.state != AllocationState::ACTIVE) {
+            return TMS_CHUNK_ALLOCATION_PAUSED;
+        }
+    }
+    for (size_t i = 0; i < count; ++i) {
+        const ChunkRef &ref = refs[indices[i]];
+        ref.metadata->chunks[ref.index].backup = enabled;
     }
     return TMS_CHUNK_OK;
 }
