@@ -253,6 +253,27 @@ def run(hook_mode: str):
     torch_memory_saver.resume(_TAG_DST)
     assert states(_TAG_DST) == [True, True, True, True, False, False]
     assert kept(dst, {0: 1, 1: 2, 2: 22})
+    # The same for a destination that is active when its source is freed. Chunks 4 and 5,
+    # of which chunk 4 is turned on again, map a new source and are unmapped with it.
+    with torch_memory_saver.region(tag=_TAG_SRC, enable_cpu_backup=True, chunk_size=chunk):
+        src = torch.empty((2 * chunk,), dtype=torch.uint8, device=device)
+    torch_memory_saver.set_chunk_backup(_TAG_DST, [4], True)
+    torch_memory_saver.map_chunks(_TAG_DST, [4, 5], _TAG_SRC, [0, 1])
+    assert states(_TAG_DST) == [True] * 6
+    del src
+    for key in [key for key in impl._mem_pools if key[0] == _TAG_SRC]:
+        del impl._mem_pools[key]
+    gc.collect()
+    empty_cache()
+    assert torch_memory_saver.get_chunk_layout(_TAG_SRC) == []
+    assert states(_TAG_DST) == [True, True, True, True, False, False]
+    torch_memory_saver.resume_chunks(_TAG_DST, [4, 5])
+    fill(dst, {4: 44, 5: 55})
+    torch_memory_saver.pause(_TAG_DST)
+    assert_backup(dst, {0: 1, 1: 2, 2: 22, 4: 44})
+    torch_memory_saver.resume(_TAG_DST)
+    assert states(_TAG_DST) == [True] * 6
+    assert kept(dst, {0: 1, 1: 2, 2: 22, 4: 44})
 
     # Part 6: refused calls, with either value. The first chunk of a refused list is not
     # changed either: chunk 0 stays on, and chunk 1, which is turned off here, stays off.
