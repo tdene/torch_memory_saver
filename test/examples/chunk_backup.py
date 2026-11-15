@@ -6,8 +6,10 @@ one host slot. Part 2 turns chunks off: the pause still returns the device memor
 chunk, copies the enabled ones only, and the resume restores exactly those. Part 3 changes
 the selection between pauses, down to none and back to all. Part 4 does so with retained
 backups. Part 5 keeps one backup of a map_chunks() pair, on the destination and then on
-the source. Part 6: a refused call changes nothing. run_host_bytes() reads the size of the
-host slot, retained or not, from the memory of the process.
+the source. Part 6: a refused call changes nothing. Part 7 is a tag with two allocations:
+its chunks are numbered across them, and a chunk keeps its choice when it gets memory and
+when the allocation before it is freed. run_host_bytes() reads the size of the host slot,
+retained or not, from the memory of the process.
 """
 
 import gc
@@ -22,6 +24,7 @@ _TAG = "chunk_backup"
 _TAG_SRC = "chunk_backup_src"
 _TAG_DST = "chunk_backup_dst"
 _TAG_UNBACKED = "chunk_backup_unbacked"
+_TAG_SEGMENTS = "chunk_backup_segments"
 _CHUNKS = 8
 _HELD = (0, 1, 2, 5, 6)  # the chunks of _TAG that hold memory
 
@@ -225,10 +228,64 @@ def run(hook_mode: str):
     _assert_raises(RuntimeError, torch_memory_saver.set_chunk_backup, _TAG, [0], False)
     torch_memory_saver.resume(_TAG)
     pause_and_resume(cache, values(80))
+
+    # Part 7: a tag with two allocations, like the segments of one pool. Chunks 0 and 1 are
+    # the first's, chunks 2 to 5 the second's.
+    impl = torch_memory_saver._impl
+    with torch_memory_saver.region(tag=_TAG_SEGMENTS, enable_cpu_backup=True, chunk_size=chunk):
+        first = torch.empty((2 * chunk,), dtype=torch.uint8, device=device)
+    [first_pool] = [key for key in impl._mem_pools if key[0] == _TAG_SEGMENTS]
+    with torch_memory_saver.region(
+        tag=_TAG_SEGMENTS, enable_cpu_backup=True, chunk_size=chunk, initially_released=True
+    ):
+        second = torch.empty((4 * chunk,), dtype=torch.uint8, device=device)
+    assert [address for address, _ in torch_memory_saver.get_chunk_layout(_TAG_SEGMENTS)] == (
+        [first.data_ptr() + i * chunk for i in range(2)]
+        + [second.data_ptr() + i * chunk for i in range(4)]
+    )
+    torch_memory_saver.resume_chunks(_TAG_SEGMENTS, [2, 3])
+
+    # Off: a chunk of each allocation, and chunk 4, which holds no memory yet and stays off
+    # when it gets some.
+    torch_memory_saver.set_chunk_backup(_TAG_SEGMENTS, [1, 3, 4], False)
+    torch_memory_saver.resume_chunks(_TAG_SEGMENTS, [4])
+    assert states(_TAG_SEGMENTS) == [True] * 5 + [False]
+    fill(first, {0: 90, 1: 91})
+    fill(second, {0: 92, 1: 93, 2: 94})
+    torch_memory_saver.pause(_TAG_SEGMENTS)
+    assert states(_TAG_SEGMENTS) == [False] * 6
+    assert_backup(first, {0: 90})
+    assert_backup(second, {0: 92})
+    torch_memory_saver.resume(_TAG_SEGMENTS)
+    assert states(_TAG_SEGMENTS) == [True] * 5 + [False]
+    assert kept(first, {0: 90}) and kept(second, {0: 92})
+
+    # Freeing the first allocation numbers the chunks of the second from 0. Each keeps its
+    # choice, and the call takes the new numbers.
+    del first, impl._mem_pools[first_pool]
+    gc.collect()
+    empty_cache()
+    assert torch_memory_saver.get_chunk_layout(_TAG_SEGMENTS) == [
+        (second.data_ptr() + i * chunk, chunk) for i in range(4)
+    ]
+    assert states(_TAG_SEGMENTS) == [True, True, True, False]
+    _assert_raises(IndexError, torch_memory_saver.set_chunk_backup, _TAG_SEGMENTS, [0, 4], False)
+    fill(second, {0: 95, 1: 96, 2: 97})
+    torch_memory_saver.pause(_TAG_SEGMENTS)
+    assert_backup(second, {0: 95})
+    torch_memory_saver.resume(_TAG_SEGMENTS)
+    assert kept(second, {0: 95})
+    torch_memory_saver.set_chunk_backup(_TAG_SEGMENTS, [1], True)
+    fill(second, {1: 98})
+    torch_memory_saver.pause(_TAG_SEGMENTS)
+    assert_backup(second, {0: 95, 1: 98})
+    torch_memory_saver.resume(_TAG_SEGMENTS)
+    assert states(_TAG_SEGMENTS) == [True, True, True, False]
+    assert kept(second, {0: 95, 1: 98})
     assert _holds(normal_tensor, 100)
 
     # Return the regions' memory before the interpreter exits: the tensors, then their pools.
-    del cache, src, dst, unbacked
+    del cache, src, dst, unbacked, second
     torch_memory_saver._impl._mem_pools.clear()
     gc.collect()
     empty_cache()
