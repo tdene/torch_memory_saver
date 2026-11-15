@@ -7,7 +7,7 @@ chunk, copies the enabled ones only, and the resume restores exactly those. Part
 the selection between pauses, down to none and back to all. Part 4 does so with retained
 backups. Part 5 keeps one backup of a map_chunks() pair, on the destination and then on
 the source. Part 6: a refused call changes nothing. run_host_bytes() reads the size of the
-host slot from the memory of the process.
+host slot, retained or not, from the memory of the process.
 """
 
 import gc
@@ -137,7 +137,7 @@ def run(hook_mode: str):
     pause_and_resume(cache, values(50))
 
     # Part 4: a retained backup is that of the last pause, whatever is chosen since, and
-    # the next pause makes it the size of its own selection.
+    # the next pause replaces it with its own selection. run_host_bytes() reads its size.
     torch_memory_saver.retain_cpu_backup = True
     torch_memory_saver.set_chunk_backup(_TAG, [0, 1], False)
     fill(cache, values(60))
@@ -236,7 +236,8 @@ def run(hook_mode: str):
 
 def run_host_bytes(hook_mode: str):
     """The host slot of the mmap backend is anonymous memory of the process: a pause takes
-    as much of it as the enabled chunks hold, and the resume gives it back."""
+    as much of it as the enabled chunks hold, and the resume gives it back unless backups
+    are retained."""
     torch_memory_saver.hook_mode = hook_mode
     device = get_device()
     mod = get_device_module()
@@ -268,6 +269,27 @@ def run_host_bytes(hook_mode: str):
     assert all(_holds(tensor[i * chunk : (i + 1) * chunk], 7) for i in (2, 5, 6))
     torch_memory_saver.set_chunk_backup(_TAG, [2, 5, 6], False)
     assert abs(host_bytes_of_pause()) < slack
+
+    # A retained slot outlives the resume. The next pause makes it the size of its own
+    # selection, smaller as well as larger, and frees it when no chunk is enabled.
+    torch_memory_saver.retain_cpu_backup = True
+    mod.synchronize()
+    without_slot = _anonymous_bytes()
+
+    def retained_bytes(enabled, value):
+        tensor.fill_(value)
+        torch_memory_saver.set_chunk_backup(_TAG, range(_CHUNKS), False)
+        torch_memory_saver.set_chunk_backup(_TAG, enabled, True)
+        torch_memory_saver.pause(_TAG)
+        torch_memory_saver.resume(_TAG)
+        mod.synchronize()
+        assert all(_holds(tensor[i * chunk : (i + 1) * chunk], value) for i in enabled)
+        return _anonymous_bytes() - without_slot
+
+    assert abs(retained_bytes([2, 5, 6], 1) - 3 * chunk) < slack
+    assert abs(retained_bytes([2, 6], 2) - 2 * chunk) < slack
+    assert abs(retained_bytes([0, 1, 2, 6], 3) - 4 * chunk) < slack
+    assert abs(retained_bytes([], 4)) < slack
 
     del tensor
     torch_memory_saver._impl._mem_pools.clear()
