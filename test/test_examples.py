@@ -36,6 +36,7 @@ from examples import (
     chunked,
     map_chunks,
     chunk_backup,
+    chunk_backup_copy,
 )
 
 # XPU only supports hook_mode='torch'; MUSA supports both hook modes.
@@ -362,6 +363,24 @@ def test_chunk_backup(hook_mode):
 )
 def test_chunk_backup_host_bytes():
     _test_core(chunk_backup.run_host_bytes, hook_mode="torch")
+
+
+@_cuda_only
+@pytest.mark.skipif(
+    not _device_module.is_available(),
+    reason="A chunk backup that is copied beside the mapping calls requires a GPU",
+)
+@pytest.mark.parametrize("hook_mode", _HOOK_MODES)
+def test_chunk_backup_copy(hook_mode):
+    ctx = torch_memory_saver.configure_subprocess() if hook_mode == "preload" else nullcontext()
+    with ctx:
+        # A device fault under a copy ends the child before it reports: its exit status is the result.
+        subprocess.run(
+            [sys.executable, chunk_backup_copy.__file__, hook_mode],
+            env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+            check=True,
+            timeout=600,
+        )
 
 
 @pytest.mark.skipif(
