@@ -15,8 +15,13 @@ same moment in all of them: if the driver serves one process at a time, the time
 are N times those of --processes 1. "on CPU %" is the share of a cycle a process spent
 running; a process that waits for another one inside the driver sleeps, unless the driver spins.
 
+The library sets the GPUDirect RDMA flag on every handle where the device supports it; vmm.py
+and driver_call_timing.py leave it clear. --rdma-flag clear times the same calls on handles
+without it, so the flag's share of the cost can be told from the processes' share.
+
 Usage: python suspend_cost.py [--processes 1] [--piece-mib 4 16 64] [--line-gib 168]
-           [--second-fraction 0.70] [--cycles 3] [--out suspend_cost_1p.json]
+           [--second-fraction 0.70] [--cycles 3] [--rdma-flag library|clear]
+           [--out suspend_cost_1p.json]
 Exits 1 on a driver error, with the failing call named, and 2 on a refused configuration.
 """
 
@@ -61,11 +66,14 @@ class LibraryDriver(Driver):
     """Creates a handle the way the library's cu_mem_create does (csrc/utils.h).
 
     Before every cuMemCreate the library asks the device whether it supports the GPUDirect
-    RDMA flag, and sets the flag if it does. vmm.py leaves the flag clear.
+    RDMA flag, and sets the flag if it does. vmm.py leaves the flag clear, and so does this
+    class with `library_flag` False: it then creates a handle as vmm.py does, without the
+    question.
     """
 
-    def __init__(self, device=0):
+    def __init__(self, device=0, library_flag=True):
         super().__init__(device)
+        self.library_flag = library_flag
         c_int = ctypes.c_int
         self.lib.cuDeviceGet.argtypes = [ctypes.POINTER(c_int), c_int]
         self.lib.cuDeviceGetAttribute.argtypes = [ctypes.POINTER(c_int), c_int, c_int]
@@ -83,7 +91,8 @@ class LibraryDriver(Driver):
         return bool(self._rdma.value)
 
     def create(self, size):
-        self._prop.allocFlags.gpuDirectRDMACapable = 1 if self.rdma_capable() else 0
+        if self.library_flag:
+            self._prop.allocFlags.gpuDirectRDMACapable = 1 if self.rdma_capable() else 0
         return super().create(size)
 
 
@@ -170,7 +179,7 @@ def child(args, cases):
 
     It reports to the parent in tagged JSON lines on stdout and takes each start time from stdin.
     """
-    drv = LibraryDriver(0)
+    drv = LibraryDriver(0, library_flag=args.rdma_flag == "library")
     granularity = drv.granularity()
     name = torch.cuda.get_device_name(0)
     total = torch.cuda.mem_get_info(0)[1]
@@ -195,7 +204,7 @@ def child(args, cases):
         granularity=granularity,
         total_bytes=total,
         used_at_start=used_at_start,
-        gpu_direct_rdma_flag=drv.rdma_capable(),
+        gpu_direct_rdma_flag=drv.library_flag and drv.rdma_capable(),
     )
     for case in cases:
         region = Region(drv, case["piece_mib"] * MiB, case["handles"], case["second"])
@@ -231,6 +240,7 @@ def start_children(args, gpus):
                 "--line-gib", repr(args.line_gib),
                 "--second-fraction", repr(args.second_fraction),
                 "--cycles", str(args.cycles),
+                "--rdma-flag", args.rdma_flag,
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -410,7 +420,8 @@ def parent(args, cases):
     }
     print(
         f"processes: {args.processes}, line: {args.line_gib:g} GiB, second address for {args.second_fraction:g} "
-        f"of the pieces, cycles: {args.cycles}, driver: {result['driver_version']}, CPUs: {cpus}",
+        f"of the pieces, cycles: {args.cycles}, handles: {args.rdma_flag}, driver: {result['driver_version']}, "
+        f"CPUs: {cpus}",
         flush=True,
     )
     children = start_children(args, gpus)
@@ -439,12 +450,16 @@ def main():
     ap.add_argument("--line-gib", type=float, default=168.0, help="device memory every piece size covers, per GPU")
     ap.add_argument("--second-fraction", type=float, default=0.70, help="share of the pieces with a second address")
     ap.add_argument("--cycles", type=int, default=3)
-    ap.add_argument("--out", default=None, help="JSON file (default: suspend_cost_<processes>p.json)")
+    ap.add_argument(
+        "--rdma-flag", choices=("library", "clear"), default="library",
+        help="library: the GPUDirect RDMA flag on every handle where the device supports it; clear: never",
+    )
+    ap.add_argument("--out", default=None, help="JSON file (default: suspend_cost_<processes>p[_clear].json)")
     ap.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
     args.piece_mib = [mib for group in args.piece_mib for mib in group]
     if args.out is None:
-        args.out = f"suspend_cost_{args.processes}p.json"
+        args.out = f"suspend_cost_{args.processes}p{'_clear' if args.rdma_flag == 'clear' else ''}.json"
     if args.processes < 1 or args.cycles < 1 or args.line_gib <= 0 or min(args.piece_mib, default=0) < 1:
         ap.error("--processes, --cycles, --line-gib and every --piece-mib have to be positive")
     if not 0.0 <= args.second_fraction <= 1.0:
