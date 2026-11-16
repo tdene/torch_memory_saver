@@ -7,7 +7,9 @@
 #endif
 
 #include <algorithm>
+#include <condition_variable>
 #include <set>
+#include <thread>
 
 #if defined(USE_CUDA)
 namespace {
@@ -35,6 +37,96 @@ cudaError_t try_map(void *ptr, size_t size, CUmemGenericAllocationHandle handle,
     return cudaSuccess;
 }
 
+// The most that one copy moves between a chunked allocation and its cpu_backup slot. The
+// copies run beside the mapping calls of pause(), which follow them piece by piece, and of
+// resume(), which they follow.
+constexpr size_t kBackupCopyPieceBytes = size_t(1) << 30;
+
+// One piece of a chunked allocation's backup: host.size bytes at ptr and at host.data.
+struct BackupPiece {
+    void *ptr;
+    CpuBackupSlot host;
+    CUdevice device;
+    // resume(): how many of the call's mappings have to be made before the piece is written.
+    size_t mappings;
+};
+
+// Copies the pieces in order on a thread of its own, in the caller's context, while the
+// caller makes its mapping calls. The thread reads its pieces only: the caller keeps
+// allocator_metadata_mutex_, and ends the thread with join() or stop() before it returns.
+class BackupCopy {
+public:
+    BackupCopy(std::vector<BackupPiece> pieces, bool to_host)
+        : pieces_(std::move(pieces)), to_host_(to_host) {
+        if (pieces_.empty()) {
+            return;
+        }
+        CUcontext context = nullptr;
+        CURESULT_CHECK(cuCtxGetCurrent(&context));
+        thread_ = std::thread([this, context] { run(context); });
+    }
+
+    // What the side that leads has reached: the copy of pause() in bytes that are on the
+    // host, the caller of resume() in mappings that are made.
+    void advance(size_t reached) {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        reached_ = reached;
+        if (reached_ >= awaited_) {
+            changed_.notify_one();
+        }
+    }
+
+    // The side that follows waits for it. False once stop() was called.
+    bool wait_for(size_t awaited) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        awaited_ = awaited;
+        changed_.wait(lock, [this] { return reached_ >= awaited_ || stopped_; });
+        return !stopped_;
+    }
+
+    void join() {
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+    // The mappings that are left will not be made: the copy ends after the piece it is at.
+    void stop() {
+        {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            stopped_ = true;
+        }
+        changed_.notify_one();
+        join();
+    }
+
+private:
+    void run(CUcontext context) {
+        CURESULT_CHECK(cuCtxSetCurrent(context));
+        size_t copied = 0;
+        for (BackupPiece &piece : pieces_) {
+            if (to_host_) {
+                cpu_backuper::offload(piece.ptr, piece.host.size, piece.host);
+                copied += piece.host.size;
+                advance(copied);
+            } else if (wait_for(piece.mappings)) {
+                cpu_backuper::onload(piece.ptr, piece.host.size, piece.device, piece.host);
+            } else {
+                return;
+            }
+        }
+    }
+
+    std::vector<BackupPiece> pieces_;
+    const bool to_host_;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    size_t reached_ = 0;
+    size_t awaited_ = 0;
+    bool stopped_ = false;
+    std::thread thread_;
+};
+
 // One address range that a call has to map: through a handle of its own, which create_all()
 // makes, or, when it is added after create_all(), through the handle of another chunk.
 struct PendingMapping {
@@ -48,11 +140,16 @@ struct PendingMapping {
     bool mapped = false;
 };
 
-// All or nothing: on out of memory the mappings made by this call are removed again.
-cudaError_t map_all(std::vector<PendingMapping> &pending) {
-    for (PendingMapping &mapping : pending) {
+// All or nothing: on out of memory the mappings made by this call are removed again, once
+// the copy that follows them, if there is one, has stopped.
+cudaError_t map_all(std::vector<PendingMapping> &pending, BackupCopy *copy = nullptr) {
+    for (size_t i = 0; i < pending.size(); ++i) {
+        PendingMapping &mapping = pending[i];
         const cudaError_t ret = try_map(mapping.address, mapping.size, *mapping.handle, mapping.device);
         if (ret != cudaSuccess) {
+            if (copy != nullptr) {
+                copy->stop();
+            }
             for (PendingMapping &done : pending) {
                 if (done.mapped) {
                     CURESULT_CHECK(cuMemUnmap((CUdeviceptr) done.address, done.size));
@@ -62,6 +159,9 @@ cudaError_t map_all(std::vector<PendingMapping> &pending) {
             return ret;
         }
         mapping.mapped = true;
+        if (copy != nullptr) {
+            copy->advance(i + 1);
+        }
     }
     return cudaSuccess;
 }
@@ -116,9 +216,13 @@ void release_own_chunks(void *ptr, const AllocationMetadata &metadata) {
     }
 }
 
-// One copy per run of neighbouring chunks that are in the cpu_backup slot: they are
-// neighbours there too.
-void copy_backed_up_chunks(void *ptr, const AllocationMetadata &metadata, bool to_host) {
+// The copy of a chunked allocation's backup, cut in pieces: a run of neighbouring chunks that
+// are in the cpu_backup slot, where they are neighbours too, is copied kBackupCopyPieceBytes
+// at a time. resume() passes, for every address it maps, the number of its mappings after
+// which the address can be written: a piece waits for the last of its chunks.
+void add_backup_pieces(
+    void *ptr, const AllocationMetadata &metadata, std::vector<BackupPiece> &pieces,
+    const std::unordered_map<void *, size_t> *writable_after = nullptr) {
     const size_t count = metadata.chunks.size();
     for (size_t first = 0; first < count;) {
         if (metadata.chunks[first].backup_offset == kNoChunkBackup) {
@@ -130,23 +234,34 @@ void copy_backed_up_chunks(void *ptr, const AllocationMetadata &metadata, bool t
         for (; end < count && metadata.chunks[end].backup_offset != kNoChunkBackup; ++end) {
             bytes += chunk_bytes(metadata, end);
         }
-        CpuBackupSlot run{
-            metadata.cpu_backup.kind,
-            static_cast<uint8_t *>(metadata.cpu_backup.data) + metadata.chunks[first].backup_offset,
-            bytes};
-        void *run_ptr = chunk_ptr(ptr, metadata, first);
-        if (to_host) {
-            cpu_backuper::offload(run_ptr, bytes, run);
-        } else {
-            cpu_backuper::onload(run_ptr, bytes, metadata.device, run);
+        uint8_t *run_ptr = static_cast<uint8_t *>(chunk_ptr(ptr, metadata, first));
+        uint8_t *run_host =
+            static_cast<uint8_t *>(metadata.cpu_backup.data) + metadata.chunks[first].backup_offset;
+        for (size_t offset = 0; offset < bytes; offset += kBackupCopyPieceBytes) {
+            const size_t piece_bytes = std::min(kBackupCopyPieceBytes, bytes - offset);
+            size_t mappings = 0;
+            if (writable_after != nullptr) {
+                const size_t last = first + (offset + piece_bytes - 1) / metadata.chunk_size;
+                for (size_t i = first + offset / metadata.chunk_size; i <= last; ++i) {
+                    const auto mapping = writable_after->find(chunk_ptr(ptr, metadata, i));
+                    SIMPLE_CHECK(mapping != writable_after->end(),
+                                 "resume() does not map a chunk that is in the cpu_backup slot");
+                    mappings = std::max(mappings, mapping->second);
+                }
+            }
+            pieces.push_back(BackupPiece{
+                run_ptr + offset,
+                CpuBackupSlot{metadata.cpu_backup.kind, run_host + offset, piece_bytes},
+                metadata.device, mappings});
         }
         first = end;
     }
 }
 
-// Packs the chunks that hold memory and are to be backed up into the cpu_backup slot in index
-// order: an allocation costs host memory, and a copy, for those chunks only.
-void offload_chunks(void *ptr, AllocationMetadata &metadata) {
+// Gives the chunks that hold memory and are to be backed up their places in the cpu_backup
+// slot, packed in index order: an allocation costs host memory, and a copy, for those chunks
+// only.
+void pack_chunk_backup(AllocationMetadata &metadata) {
     size_t total = 0;
     for (size_t i = 0; i < metadata.chunks.size(); ++i) {
         Chunk &chunk = metadata.chunks[i];
@@ -165,7 +280,52 @@ void offload_chunks(void *ptr, AllocationMetadata &metadata) {
     if (metadata.cpu_backup.data == nullptr) {
         cpu_backuper::allocate(total, metadata.cpu_backup);
     }
-    copy_backed_up_chunks(ptr, metadata, true);
+}
+
+void release_chunk(void *ptr, const AllocationMetadata &metadata, size_t index) {
+    CURESULT_CHECK(cuMemUnmap(
+        (CUdeviceptr) chunk_ptr(ptr, metadata, index), chunk_bytes(metadata, index)));
+    if (metadata.chunks[index].own) {
+        CURESULT_CHECK(cuMemRelease(metadata.chunks[index].handle));
+    }
+}
+
+// pause() of the chunked allocations of a call, their backups packed. A mapped chunk is
+// backed up through its own allocation's address, on a thread beside these calls: that
+// mapping goes once the copy of the chunk has returned, every other mapping at once. The
+// memory of a chunk lives until its last mapping is gone, whichever of the two allocations
+// goes first.
+void pause_chunked(const std::vector<std::pair<void *, AllocationMetadata *>> &allocations) {
+    std::vector<BackupPiece> pieces;
+    for (const auto &allocation : allocations) {
+        add_backup_pieces(allocation.first, *allocation.second, pieces);
+    }
+    BackupCopy copy(std::move(pieces), true);
+    for (const auto &allocation : allocations) {
+        const AllocationMetadata &metadata = *allocation.second;
+        for (size_t i = 0; i < metadata.chunks.size(); ++i) {
+            const Chunk &chunk = metadata.chunks[i];
+            if (chunk.holds_memory() && chunk.backup_offset == kNoChunkBackup) {
+                release_chunk(allocation.first, metadata, i);
+            }
+        }
+    }
+    // The copy takes the slots in this order, and each of them from its start to its end.
+    size_t copied_before = 0;
+    for (const auto &allocation : allocations) {
+        AllocationMetadata &metadata = *allocation.second;
+        for (size_t i = 0; i < metadata.chunks.size(); ++i) {
+            const size_t offset = metadata.chunks[i].backup_offset;
+            if (offset != kNoChunkBackup) {
+                SIMPLE_CHECK(copy.wait_for(copied_before + offset + chunk_bytes(metadata, i)),
+                             "the copy of a pause() was stopped");
+                release_chunk(allocation.first, metadata, i);
+            }
+        }
+        copied_before += metadata.cpu_backup.size;
+        metadata.state = AllocationState::PAUSED;
+    }
+    copy.join();
 }
 
 }  // namespace
@@ -498,6 +658,7 @@ cudaError_t TorchMemorySaver::pause(const std::string& tag) {
             }
         }
     }
+    std::vector<std::pair<void *, AllocationMetadata *>> chunked;
 #endif
 
     for (auto it = allocation_metadata_.begin(); it != allocation_metadata_.end(); ++it) {
@@ -518,14 +679,10 @@ cudaError_t TorchMemorySaver::pause(const std::string& tag) {
 
 #if defined(USE_CUDA)
         if (metadata.chunk_size != 0) {
-            // A mapped chunk is backed up through this allocation's address. Its memory lives
-            // until its last mapping is gone, whichever of the two allocations goes first.
             if (metadata.enable_cpu_backup) {
-                offload_chunks(ptr, metadata);
+                pack_chunk_backup(metadata);
             }
-            unmap_borrowed_chunks(ptr, metadata);
-            release_own_chunks(ptr, metadata);
-            metadata.state = AllocationState::PAUSED;
+            chunked.emplace_back(ptr, &metadata);
             continue;
         }
 #endif
@@ -550,6 +707,9 @@ cudaError_t TorchMemorySaver::pause(const std::string& tag) {
                   << std::endl;
 #endif
     }
+#if defined(USE_CUDA)
+    pause_chunked(chunked);
+#endif
     return cudaSuccess;
 #endif
 }
@@ -567,8 +727,9 @@ cudaError_t TorchMemorySaver::resume(const std::string& tag) {
     const bool retain_cpu_backup = retain_cpu_backup_.load();
 
 #if defined(USE_CUDA)
-    // Every handle is created and mapped before a backup or a state is touched: out of memory
-    // leaves every matching allocation paused with its backup, and the call can be repeated.
+    // Every handle is created before a backup is read, and every mapping is made before a
+    // backup is released or a state is changed: out of memory leaves every matching allocation
+    // paused with its backup, and the call can be repeated.
     std::vector<PendingMapping> pending;
     for (auto &kv : allocation_metadata_) {
         AllocationMetadata &metadata = kv.second;
@@ -628,11 +789,30 @@ cudaError_t TorchMemorySaver::resume(const std::string& tag) {
             }
         }
     }
-    pending_ret = map_all(pending);
+    // The backups of the chunked allocations are copied back on a thread beside the mapping
+    // calls. A chunk of new memory is written once it is mapped: the memory goes with a call
+    // that fails. A mapping of a source's memory shows memory that stays, and is written
+    // once every mapping is made.
+    std::unordered_map<void *, size_t> writable_after;
+    writable_after.reserve(pending.size());
+    for (size_t i = 0; i < pending.size(); ++i) {
+        writable_after[pending[i].address] = pending[i].created ? i + 1 : pending.size();
+    }
+    std::vector<BackupPiece> pieces;
+    for (const auto &kv : allocation_metadata_) {
+        const AllocationMetadata &metadata = kv.second;
+        if ((tag.empty() || metadata.tag == tag) && metadata.cpu_backup.data != nullptr
+                && metadata.chunk_size != 0) {
+            add_backup_pieces(kv.first, metadata, pieces, &writable_after);
+        }
+    }
+    BackupCopy copy(std::move(pieces), false);
+    pending_ret = map_all(pending, &copy);
     if (pending_ret != cudaSuccess) {
         release_created(pending);
         return pending_ret;
     }
+    copy.join();
 #endif
 
     for (auto it = allocation_metadata_.begin(); it != allocation_metadata_.end(); ++it) {
@@ -653,11 +833,8 @@ cudaError_t TorchMemorySaver::resume(const std::string& tag) {
 
 #if defined(USE_CUDA)
         if (metadata.chunk_size != 0) {
-            if (metadata.cpu_backup.data != nullptr) {
-                copy_backed_up_chunks(ptr, metadata, false);
-                if (!retain_cpu_backup) {
-                    cpu_backuper::release(metadata.cpu_backup);
-                }
+            if (!retain_cpu_backup) {
+                cpu_backuper::release(metadata.cpu_backup);
             }
             metadata.state = AllocationState::ACTIVE;
             continue;
